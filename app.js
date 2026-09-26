@@ -17,7 +17,7 @@ import {
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-auth.js';
 import {
   initializeFirestore, getFirestore, persistentLocalCache, persistentMultipleTabManager,
-  connectFirestoreEmulator, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDocs,
+  connectFirestoreEmulator, collection, doc, addDoc, setDoc, updateDoc, deleteDoc, getDoc, getDocs,
   onSnapshot, query, where, writeBatch, serverTimestamp, Timestamp,
 } from 'https://www.gstatic.com/firebasejs/10.14.1/firebase-firestore.js';
 import { firebaseConfig } from './firebase-config.js';
@@ -26,7 +26,7 @@ import * as L from './logic.js';
 window.__lifeosBooted = true; // informuje ekran startowy, że moduły się załadowały
 
 // ============================================================ 1. START I FIREBASE
-const APP_VERSION = '1.0.0';
+const APP_VERSION = '1.1.0';
 const HOUR_PX = 64; // wysokość jednej godziny na osi czasu (musi zgadzać się z .tl-body w index.html: 18 × 64 = 1152)
 
 // Wymagane są tylko te 4 pola. storageBucket i messagingSenderId mogą zostać z „WKLEJ_TUTAJ”, bo aplikacja z nich nie korzysta.
@@ -65,8 +65,12 @@ const WORDS = {
   task: ['zadanie', 'zadania', 'zadań'],
 };
 
+let savedListId = null;
+try { savedListId = localStorage.getItem('lifeos-tasklist') || null; } catch (e) { /* prywatny tryb */ }
+
 const state = {
-  user: null, tasks: [], cards: [], events: [], monthEvents: [],
+  user: null, tasks: [], cards: [], events: [], monthEvents: [], taskLists: [],
+  currentListId: savedListId,
   date: L.dateKey(),
   plannerMode: 'day', // 'day' | 'month'
   month: L.monthKey(),
@@ -130,12 +134,16 @@ function listenError(name, err) {
 /** Włącza nasłuch na żywo: każda zmiana z drugiego urządzenia pojawia się tu sama. */
 function startData() {
   stopData();
-  const watch = (name, key) => onSnapshot(colRef(name), (snap) => {
+  const watch = (name, key, pendingKey) => onSnapshot(colRef(name), (snap) => {
     state[key] = snap.docs.map(mapDoc);
-    state.pending[name === 'tasks' ? 'tasks' : 'cards'] = snap.metadata.hasPendingWrites;
+    if (pendingKey) state.pending[pendingKey] = snap.metadata.hasPendingWrites;
     scheduleRender();
   }, (err) => listenError(name, err));
-  unsubs = [watch('tasks', 'tasks'), watch('flashcards', 'cards')];
+  unsubs = [
+    watch('tasks', 'tasks', 'tasks'),
+    watch('flashcards', 'cards', 'cards'),
+    watch('task_lists', 'taskLists', null),
+  ];
   listenPlanner();
 }
 
@@ -211,7 +219,7 @@ function stopData() {
   unsubs.forEach((u) => u());
   unsubs = [];
   stopEventListeners();
-  Object.assign(state, { tasks: [], cards: [], events: [], monthEvents: [] });
+  Object.assign(state, { tasks: [], cards: [], events: [], monthEvents: [], taskLists: [] });
 }
 
 function dbError(err) {
@@ -419,9 +427,11 @@ const PlannerView = {
     $('#pl-allday').innerHTML = allDay.map((ev) => {
       const color = L.safeColor(ev.colorCode);
       const span = ev.date === ev.endDate ? '' : L.formatDateRangeShort(ev.date, ev.endDate);
+      const descLabel = ev.description ? `. ${esc(ev.description)}` : '';
       return `<button type="button" class="allday-chip" data-act="pl-allday-edit" data-id="${esc(ev.id)}"
-        style="border-left-color:${color};background-color:${color}22" aria-label="Całodniowe: ${esc(ev.title)}${span ? `, ${esc(span)}` : ''}">
-        <span class="allday-title">${esc(ev.title)}</span>${span ? `<span class="allday-range">${esc(span)}</span>` : ''}</button>`;
+        style="border-left-color:${color};background-color:${color}22" aria-label="Całodniowe: ${esc(ev.title)}${span ? `, ${esc(span)}` : ''}${descLabel}">
+        <span class="allday-title">${esc(ev.title)}</span>${span ? `<span class="allday-range">${esc(span)}</span>` : ''}
+        ${ev.description ? `<span class="allday-range line-clamp-2">${esc(ev.description)}</span>` : ''}</button>`;
     }).join('');
 
     const blocks = L.layoutEvents(timed).map((ev) => {
@@ -431,10 +441,11 @@ const PlannerView = {
       const width = 100 / ev.cols;
       const range = `${L.toHHMM(ev.startMin)}–${L.toHHMM(Math.min(ev.endMin, 24 * 60 - 1))}`;
       const compact = height < 46;
-      return `<button type="button" class="ev" data-id="${esc(ev.id)}" aria-label="${esc(ev.title)}, ${range}"
+      const descLabel = ev.description ? `. ${esc(ev.description)}` : '';
+      return `<button type="button" class="ev" data-id="${esc(ev.id)}" aria-label="${esc(ev.title)}, ${range}${descLabel}"
         style="top:${top}px;height:${height - 2}px;left:calc(${ev.col * width}% + 2px);width:calc(${width}% - 4px);background-color:${color}38;border-left-color:${color}">
         ${compact ? `<span class="ev-compact"><span class="ev-title">${esc(ev.title)}</span><span class="ev-time">${range}</span></span>`
-    : `<span class="ev-title">${esc(ev.title)}</span><span class="ev-time">${range}</span>`}</button>`;
+    : `<span class="ev-title">${esc(ev.title)}</span><span class="ev-time">${range}</span>${ev.description ? `<span class="ev-desc line-clamp-2">${esc(ev.description)}</span>` : ''}`}</button>`;
     }).join('');
     $('#tl-events').innerHTML = blocks;
     this.drawNow();
@@ -449,15 +460,22 @@ const PlannerView = {
     $('#pl-sub').innerHTML = isCurrentMonth ? '' : '<button type="button" class="btn btn-tonal" data-act="pl-month-today">Wróć do bieżącego miesiąca</button>';
     const weeks = L.monthGrid(state.month);
     const head = L.WEEKDAY_LABELS_PL.map((w) => `<div class="mg-head">${esc(w)}</div>`).join('');
+    const MAX_SHOWN = 3;
     const body = weeks.map((week) => week.map((cell) => {
-      const dayEvents = state.monthEvents.filter((ev) => L.eventTouchesDay(ev, cell.key));
-      const dots = dayEvents.slice(0, 3).map((ev) => `<span class="mg-dot" style="background:${L.safeColor(ev.colorCode)}"></span>`).join('');
-      const more = dayEvents.length > 3 ? `<span class="mg-more">+${dayEvents.length - 3}</span>` : '';
-      const label = `${L.formatDateLong(cell.key)}${dayEvents.length ? `, ${L.plural(dayEvents.length, WORDS.event)}` : ''}`;
+      const dayEvents = state.monthEvents.filter((ev) => L.eventTouchesDay(ev, cell.key))
+        .sort((a, b) => (Number(!!b.allDay) - Number(!!a.allDay)) || (a.startTime || '').localeCompare(b.startTime || '') || a.title.localeCompare(b.title, 'pl'));
+      const shown = dayEvents.slice(0, MAX_SHOWN);
+      const chips = shown.map((ev) => {
+        const color = L.safeColor(ev.colorCode);
+        return `<span class="mg-chip" style="background-color:${color}26;border-left-color:${color}">${esc(ev.title)}</span>`;
+      }).join('');
+      const restCount = dayEvents.length - shown.length;
+      const more = restCount > 0 ? `<span class="mg-more">+${restCount} więcej</span>` : '';
+      const label = `${L.formatDateLong(cell.key)}${dayEvents.length ? `, ${L.plural(dayEvents.length, WORDS.event)}: ${dayEvents.map((e) => e.title).join(', ')}` : ''}`;
       return `<button type="button" class="mg-day${cell.inMonth ? '' : ' mg-out'}${cell.key === today ? ' mg-today' : ''}${cell.key === state.date ? ' mg-selected' : ''}"
         data-act="pl-goto-day" data-key="${cell.key}" aria-label="${esc(label)}">
         <span class="mg-num">${cell.day}</span>
-        ${dayEvents.length ? `<span class="mg-dots">${dots}${more}</span>` : ''}</button>`;
+        ${dayEvents.length ? `<span class="mg-events">${chips}${more}</span>` : ''}</button>`;
     }).join('')).join('');
     $('#pl-monthview').innerHTML = `<div class="mg-head-row">${head}</div><div class="mg-grid">${body}</div>`;
   },
@@ -528,11 +546,11 @@ function openEventSheet({ id, startTime, endTime, date } = {}) {
     ? {
       title: ev.title, date: ev.date, start: ev.startTime || start,
       end: ev.endTime || L.toHHMM(Math.min(L.toMinutes(start) + 60, 23 * 60 + 59)),
-      endDate: ev.endDate || ev.date, color: L.safeColor(ev.colorCode),
+      endDate: ev.endDate || ev.date, color: L.safeColor(ev.colorCode), description: ev.description || '',
     }
     : {
       title: '', date: date || state.date, start, end: endTime || L.toHHMM(Math.min(L.toMinutes(start) + 60, 23 * 60 + 59)),
-      endDate: date || state.date, color: L.DEFAULT_EVENT_COLOR,
+      endDate: date || state.date, color: L.DEFAULT_EVENT_COLOR, description: '',
     };
   const swatches = L.EVENT_COLORS.map((c) => `<label class="swatch" title="${c.name}">
       <input type="radio" name="color" value="${c.hex}" class="sr-only" aria-label="${c.name}" ${c.hex.toLowerCase() === v.color.toLowerCase() ? 'checked' : ''}>
@@ -542,6 +560,9 @@ function openEventSheet({ id, startTime, endTime, date } = {}) {
     body: `<form data-form="event" data-id="${esc(id || '')}" style="display:flex;flex-direction:column;gap:.9rem" novalidate>
       <div><label class="label" for="ev-title">Nazwa</label>
         <input id="ev-title" name="title" class="field" maxlength="120" value="${esc(v.title)}" ${ev ? '' : 'autofocus'} autocomplete="off"></div>
+
+      <div><label class="label" for="ev-desc">Opis (opcjonalnie)</label>
+        <textarea id="ev-desc" name="description" class="field" maxlength="${L.MAX_EVENT_DESC}" rows="3">${esc(v.description)}</textarea></div>
 
       <fieldset class="seg-field"><legend class="sr-only">Rodzaj wydarzenia</legend>
         <div class="seg">
@@ -572,11 +593,108 @@ function openEventSheet({ id, startTime, endTime, date } = {}) {
 }
 
 // ===================================================================== 7. ZADANIA
+/** Nazwa aktualnie wybranej listy zadań (null/brak = lista domyślna „Zadania”). */
+function currentListName() {
+  if (!state.currentListId) return 'Zadania';
+  const l = state.taskLists.find((x) => x.id === state.currentListId);
+  return l ? l.name : 'Zadania';
+}
+
+/** Przełącza aktywną listę zadań i zapamiętuje wybór (tylko wygoda UI – nie ma tego w bazie). */
+function setCurrentList(id) {
+  const next = id || null;
+  if (next === state.currentListId) return;
+  state.currentListId = next;
+  try {
+    if (next) localStorage.setItem('lifeos-tasklist', next);
+    else localStorage.removeItem('lifeos-tasklist');
+  } catch (e) { /* prywatny tryb */ }
+  TasksView.addingSubtaskFor = null;
+  scheduleRender();
+}
+
+function openListSwitcher() {
+  const others = [...state.taskLists].sort((a, b) => a.name.localeCompare(b.name, 'pl'));
+  const rows = [{ id: null, name: 'Zadania' }, ...others].map((l) => {
+    const active = (l.id || null) === state.currentListId;
+    const count = L.tasksInList(state.tasks, l.id).filter((t) => !t.completed).length;
+    return `<li style="display:flex;align-items:center;gap:.15rem">
+        <button type="button" class="btn btn-plain" style="flex:1;justify-content:flex-start;gap:.6rem;min-height:52px" data-act="ta-list-pick" data-id="${esc(l.id || '')}" aria-pressed="${active}">
+          ${active ? icon('check', 'ic') : '<span class="ic" aria-hidden="true"></span>'}
+          <span style="flex:1;text-align:left;overflow-wrap:anywhere">${esc(l.name)}</span>
+          ${count ? `<span class="text-muted" style="font-size:.85rem">${count}</span>` : ''}</button>
+        ${l.id ? `<button type="button" class="icon-btn" data-act="ta-list-rename" data-id="${esc(l.id)}" aria-label="Zmień nazwę listy: ${esc(l.name)}">${icon('pencil')}</button>
+          <button type="button" class="icon-btn danger" data-act="ta-list-del" data-id="${esc(l.id)}" aria-label="Usuń listę: ${esc(l.name)}">${icon('trash-2')}</button>` : ''}
+      </li>`;
+  }).join('');
+  openSheet({
+    title: 'Listy zadań',
+    body: `<ul class="space-y-2" role="list" style="margin-bottom:1.1rem">${rows}</ul>
+      <form data-form="tasklist" style="display:flex;flex-direction:column;gap:.5rem">
+        <div style="display:flex;gap:.5rem">
+          <label class="sr-only" for="tl-name">Nazwa nowej listy</label>
+          <input id="tl-name" name="name" class="field" style="flex:1;min-width:0" placeholder="Nowa lista…" maxlength="${L.MAX_LIST_NAME}" autocomplete="off">
+          <button type="submit" class="btn btn-primary" style="width:48px;padding:0" aria-label="Utwórz listę">${icon('plus')}</button>
+        </div>
+        <p class="form-error hide" role="alert"></p>
+      </form>`,
+  });
+}
+
+function openListRename(id) {
+  const l = state.taskLists.find((x) => x.id === id);
+  if (!l) return;
+  openSheet({
+    title: 'Zmień nazwę listy',
+    body: `<form data-form="tasklist-rename" data-id="${esc(id)}" style="display:flex;flex-direction:column;gap:.9rem">
+      <div><label class="label" for="tlr-name">Nazwa</label>
+        <input id="tlr-name" name="name" class="field" maxlength="${L.MAX_LIST_NAME}" value="${esc(l.name)}" autofocus autocomplete="off"></div>
+      <p class="form-error hide" role="alert"></p>
+      <button type="submit" class="btn btn-lg btn-primary">Zapisz</button></form>`,
+  });
+}
+
+/** Usuwa listę razem z jej zadaniami (jeden batch = jeden „Cofnij”, tak jak przy usuwaniu działu fiszek). */
+async function deleteTaskList(id) {
+  const l = state.taskLists.find((x) => x.id === id);
+  if (!l) return;
+  const items = state.tasks.filter((t) => t.listId === id);
+  const ok = await confirmSheet({
+    title: `Usunąć listę „${l.name}”?`,
+    message: items.length
+      ? `Razem z listą zostanie usuniętych: ${L.plural(items.length, WORDS.task)}. Zaraz po usunięciu możesz to cofnąć.`
+      : 'Ta lista jest pusta.',
+    confirmLabel: 'Usuń listę',
+  });
+  if (!ok) return;
+  if (state.currentListId === id) setCurrentList(null);
+  const raws = items.map((it) => ({ id: it.id, raw: toRaw(it) }));
+  const listRaw = toRaw(l);
+  const batch = writeBatch(db);
+  items.forEach((t) => batch.delete(docRef('tasks', t.id)));
+  batch.delete(docRef('task_lists', id));
+  batch.commit().catch(dbError);
+  toast(`Usunięto listę „${l.name}”${items.length ? ` i ${L.plural(items.length, WORDS.task)}` : ''}`, {
+    action: 'Cofnij', ms: 9000,
+    onAction: () => {
+      const undo = writeBatch(db);
+      undo.set(docRef('task_lists', id), listRaw);
+      raws.forEach((r) => undo.set(docRef('tasks', r.id), r.raw));
+      undo.commit().catch(dbError);
+    },
+  });
+}
+
 const TasksView = {
-  mounted: false, prio: 'medium', focusId: null,
+  mounted: false, prio: 'medium', focusId: null, addingSubtaskFor: null, focusSubtaskInput: false,
 
   mount() {
-    $('#view').innerHTML = '<div class="page"><h1 class="page-title">Zadania</h1><p class="page-sub" id="ta-sub"></p><div id="ta-body"></div></div>';
+    $('#view').innerHTML = `<div class="page">
+        <div class="pl-headrow">
+          <h1 class="page-title">Zadania</h1>
+          <button type="button" class="btn btn-tonal" data-act="ta-switch-list" id="ta-listbtn" aria-haspopup="dialog"></button>
+        </div>
+        <p class="page-sub" id="ta-sub"></p><div id="ta-body"></div></div>`;
     $('#dock').innerHTML = `<form data-form="task" class="dock-pill glass" autocomplete="off">
         <label class="sr-only" for="ta-input">Nowe zadanie</label>
         <input id="ta-input" name="title" class="field" style="flex:1;min-width:0" placeholder="Nowe zadanie" maxlength="200" enterkeyhint="done">
@@ -588,7 +706,7 @@ const TasksView = {
     this.mounted = true;
     refreshIcons();
   },
-  unmount() { this.mounted = false; },
+  unmount() { this.mounted = false; this.addingSubtaskFor = null; },
 
   renderPrio() {
     const b = $('#ta-newprio');
@@ -597,32 +715,63 @@ const TasksView = {
   },
   cycleNew() { this.prio = L.nextPriority(this.prio); this.renderPrio(); },
 
-  row(t) {
+  row(t, { sub = false } = {}) {
     const done = !!t.completed;
-    return `<li class="card" data-task="${esc(t.id)}" style="display:flex;align-items:center;gap:.25rem;padding:.25rem .25rem .25rem .35rem">
+    const prioBtn = sub ? '' : `<button type="button" class="chip-btn" data-act="ta-prio" data-id="${esc(t.id)}" aria-label="Priorytet: ${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}. Zmień. Zadanie: ${esc(t.title)}">
+        <span class="chip chip-${L.PRIORITIES.includes(t.priority) ? t.priority : 'medium'}">${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}</span></button>`;
+    const subtaskBtn = sub ? '' : `<button type="button" class="icon-btn" data-act="ta-subtask-add" data-id="${esc(t.id)}" aria-label="Dodaj podzadanie do: ${esc(t.title)}">${icon('corner-down-right')}</button>`;
+    return `<li class="card${sub ? ' task-sub' : ''}" data-task="${esc(t.id)}" style="display:flex;align-items:center;gap:.25rem;padding:.25rem .25rem .25rem .35rem">
       <label class="check-wrap"><input type="checkbox" class="check-in sr-only" data-id="${esc(t.id)}" ${done ? 'checked' : ''} aria-label="${done ? 'Ukończone' : 'Do zrobienia'}: ${esc(t.title)}">
         <span class="check-box">${icon('check')}</span></label>
       <p class="${done ? 'task-done' : ''}" style="flex:1;min-width:0;overflow-wrap:anywhere;padding:.4rem 0">${esc(t.title)}</p>
-      <button type="button" class="chip-btn" data-act="ta-prio" data-id="${esc(t.id)}" aria-label="Priorytet: ${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}. Zmień. Zadanie: ${esc(t.title)}">
-        <span class="chip chip-${L.PRIORITIES.includes(t.priority) ? t.priority : 'medium'}">${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}</span></button>
+      ${prioBtn}${subtaskBtn}
       <button type="button" class="icon-btn danger" data-act="ta-del" data-id="${esc(t.id)}" aria-label="Usuń zadanie: ${esc(t.title)}">${icon('trash-2')}</button></li>`;
   },
 
+  subtaskForm(parentId) {
+    return `<li class="card task-sub" style="padding:.5rem .75rem">
+      <form data-form="subtask" data-parent="${esc(parentId)}" style="display:flex;gap:.4rem;align-items:center">
+        <label class="sr-only" for="ta-sub-input">Nazwa podzadania</label>
+        <input id="ta-sub-input" name="title" class="field" style="flex:1;min-width:0" placeholder="Nazwa podzadania" maxlength="200">
+        <button type="submit" class="btn btn-primary" style="width:44px;padding:0" aria-label="Dodaj podzadanie">${icon('plus')}</button>
+        <button type="button" class="icon-btn" data-act="ta-subtask-cancel" aria-label="Anuluj dodawanie podzadania">${icon('x')}</button>
+      </form></li>`;
+  },
+
+  rowWithChildren(t) {
+    let html = this.row(t);
+    for (const sub of t.subtasks) html += this.row(sub, { sub: true });
+    if (this.addingSubtaskFor === t.id) html += this.subtaskForm(t.id);
+    return html;
+  },
+
+  startAddSubtask(id) { this.addingSubtaskFor = id; this.focusSubtaskInput = true; scheduleRender(); },
+  cancelAddSubtask() { this.addingSubtaskFor = null; scheduleRender(); },
+
   update() {
-    const sorted = L.sortTasks(state.tasks);
-    const open = sorted.filter((t) => !t.completed);
-    const done = sorted.filter((t) => t.completed);
-    $('#ta-sub').textContent = state.tasks.length ? L.plural(open.length, ['zadanie do zrobienia', 'zadania do zrobienia', 'zadań do zrobienia']) : 'Nic tu jeszcze nie ma.';
+    // Samoleczenie: lista wybrana wcześniej zniknęła (np. skasowana na innym urządzeniu) → wróć do domyślnej.
+    if (state.currentListId && !state.taskLists.some((l) => l.id === state.currentListId)) { setCurrentList(null); return; }
+    const listTasks = L.tasksInList(state.tasks, state.currentListId);
+    const tree = L.buildTaskTree(listTasks);
+    const open = tree.filter((t) => !t.completed);
+    const done = tree.filter((t) => t.completed);
+    const openCount = listTasks.filter((t) => !t.completed).length;
+
+    const btn = $('#ta-listbtn');
+    btn.innerHTML = `${esc(currentListName())} ${icon('chevron-down')}`;
+    btn.setAttribute('aria-label', `Aktualna lista zadań: ${currentListName()}. Zmień listę.`);
+
+    $('#ta-sub').textContent = listTasks.length ? L.plural(openCount, ['zadanie do zrobienia', 'zadania do zrobienia', 'zadań do zrobienia']) : 'Nic tu jeszcze nie ma.';
     let html = '';
-    if (!state.tasks.length) {
+    if (!listTasks.length) {
       html = '<div class="card" style="padding:1.5rem;margin-top:1.25rem"><p style="font-weight:600">Brak zadań</p><p class="text-muted" style="margin-top:.25rem">Wpisz pierwsze zadanie w polu na dole ekranu.</p></div>';
     } else {
-      if (open.length) html += `<h2 class="section-title">Do zrobienia</h2><ul class="space-y-2" role="list">${open.map((t) => this.row(t)).join('')}</ul>`;
+      if (open.length) html += `<h2 class="section-title">Do zrobienia</h2><ul class="space-y-2" role="list">${open.map((t) => this.rowWithChildren(t)).join('')}</ul>`;
       else html += '<div class="card" style="padding:1.25rem;margin-top:1.25rem"><p style="font-weight:600">Wszystko zrobione</p></div>';
       if (done.length) {
         html += `<div style="display:flex;align-items:center;justify-content:space-between;gap:.5rem"><h2 class="section-title">Ukończone (${done.length})</h2>`
           + '<button type="button" class="btn btn-plain" style="margin-top:1rem" data-act="ta-clear-done">Usuń ukończone</button></div>'
-          + `<ul class="space-y-2" role="list">${done.map((t) => this.row(t)).join('')}</ul>`;
+          + `<ul class="space-y-2" role="list">${done.map((t) => this.rowWithChildren(t)).join('')}</ul>`;
       }
     }
     $('#ta-body').innerHTML = html;
@@ -632,6 +781,11 @@ const TasksView = {
       if (cb) cb.focus();
       this.focusId = null;
     }
+    if (this.focusSubtaskInput) {
+      const inp = $('#ta-sub-input');
+      if (inp) inp.focus();
+      this.focusSubtaskInput = false;
+    }
   },
 
   toggle(id, checked) { this.focusId = id; updateDoc(docRef('tasks', id), { completed: checked }).catch(dbError); },
@@ -639,15 +793,32 @@ const TasksView = {
     const t = state.tasks.find((x) => x.id === id);
     if (t) updateDoc(docRef('tasks', id), { priority: L.nextPriority(t.priority) }).catch(dbError);
   },
+  /** Usuwa zadanie. Jeśli ma podzadania, kasuje je razem (jeden „Cofnij” przywraca wszystko naraz). */
   remove(id) {
     const t = state.tasks.find((x) => x.id === id);
-    if (t) deleteWithUndo('tasks', t, 'Usunięto zadanie');
+    if (!t) return;
+    const children = state.tasks.filter((x) => x.parentId === id);
+    if (children.length) {
+      deleteManyWithUndo('tasks', [t, ...children], `Usunięto zadanie i ${L.plural(children.length, ['podzadanie', 'podzadania', 'podzadań'])}`);
+    } else {
+      deleteWithUndo('tasks', t, 'Usunięto zadanie');
+    }
   },
+  /**
+   * Usuwa ukończone zadania z AKTUALNEJ listy (nie ze wszystkich list naraz!).
+   * Ukończone zadanie główne kasuje też jego podzadania (niezależnie od ich stanu) –
+   * samodzielne ukończone podzadanie pod NIEukończonym rodzicem kasuje się osobno.
+   */
   async clearDone() {
-    const done = state.tasks.filter((t) => t.completed);
-    if (!done.length) return;
-    const ok = await confirmSheet({ title: 'Usunąć ukończone zadania?', message: `Zostanie usuniętych: ${L.plural(done.length, WORDS.task)}. Zaraz po usunięciu możesz to cofnąć.`, confirmLabel: 'Usuń ukończone' });
-    if (ok) deleteManyWithUndo('tasks', done, `Usunięto ${L.plural(done.length, WORDS.task)}`);
+    const listTasks = L.tasksInList(state.tasks, state.currentListId);
+    const doneTop = listTasks.filter((t) => !t.parentId && t.completed);
+    const doneTopIds = new Set(doneTop.map((t) => t.id));
+    const childrenOfDoneTop = listTasks.filter((t) => t.parentId && doneTopIds.has(t.parentId));
+    const doneSubStandalone = listTasks.filter((t) => t.parentId && t.completed && !doneTopIds.has(t.parentId));
+    const toDelete = [...doneTop, ...childrenOfDoneTop, ...doneSubStandalone];
+    if (!toDelete.length) return;
+    const ok = await confirmSheet({ title: 'Usunąć ukończone zadania?', message: `Zostanie usuniętych: ${L.plural(toDelete.length, WORDS.task)} (razem z podzadaniami). Zaraz po usunięciu możesz to cofnąć.`, confirmLabel: 'Usuń ukończone' });
+    if (ok) deleteManyWithUndo('tasks', toDelete, `Usunięto ${L.plural(toDelete.length, WORDS.task)}`);
   },
 };
 
@@ -703,7 +874,8 @@ const CardsView = {
         <div style="display:flex;gap:.5rem;margin-top:.6rem">
           <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="all">Wszystkie (${inPath.length})</button>
           <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="hard" ${hard ? '' : 'disabled'}>Trudne (${hard})</button>
-        </div></div>`;
+        </div>
+        <button type="button" class="btn btn-tonal" style="width:100%;margin-top:.6rem" data-act="fc-share">${icon('share-2')} Udostępnij ${level ? `ten dział (${inPath.length})` : `wszystkie (${inPath.length})`}</button></div>`;
 
       if (level < 3) {
         html += `<h2 class="section-title">${['Przedmioty', 'Tematy', 'Zagadnienia'][level]}</h2><ul class="space-y-2" role="list">`;
@@ -839,6 +1011,137 @@ function previewImport() {
     : `Wszystkie fiszki z tej paczki już istnieją.${dup}`);
 }
 
+// ======================================================= 9b. UDOSTĘPNIANIE FISZEK
+/**
+ * Tworzy paczkę do udostępnienia z fiszek aktualnie widocznych w danym miejscu drzewa
+ * (cały zbiór, przedmiot, temat albo zagadnienie – to, co jest w `state.path`).
+ * Zapis idzie w JEDNYM batchu: sama paczka (`shares/{id}`, do pobrania przez link)
+ * + wskaźnik właściciela (`users/{uid}/shares_sent/{id}`, żeby dało się ją potem cofnąć).
+ */
+async function shareCurrentPath() {
+  const items = L.filterByPath(state.cards, state.path);
+  const sizeError = L.validateShareSize(items.length);
+  if (sizeError) { toast(sizeError, { ms: 8000 }); return; }
+  openSheet({ title: 'Udostępnianie…', body: '<p class="text-muted" style="padding:1rem 0">Tworzę link…</p>' });
+  try {
+    const shareRef = doc(collection(db, 'shares'));
+    const pointerRef = docRef('shares_sent', shareRef.id);
+    const label = pathName(state.path) || 'Wszystkie fiszki';
+    const batch = writeBatch(db);
+    batch.set(shareRef, { ownerUid: state.user.uid, createdAt: serverTimestamp(), cards: L.buildShareSnapshot(items) });
+    batch.set(pointerRef, { createdAt: serverTimestamp(), cardCount: items.length, label });
+    await batch.commit();
+    const link = `${location.origin}${location.pathname}#/udostepnij/${shareRef.id}`;
+    openSheet({
+      title: 'Link gotowy',
+      body: `<p class="text-muted" style="line-height:1.5">Wyślij ten link drugiej osobie (np. na czacie albo mailem). Gdy otworzy go w aplikacji i zaloguje się na SWOIM koncie, będzie mogła dodać ${L.plural(items.length, WORDS.card)} do siebie – Twoje fiszki się przy tym nie zmienią.</p>
+        <p id="share-link-text" class="field" style="margin-top:1rem;overflow-wrap:anywhere;user-select:all;font-size:.85rem">${esc(link)}</p>
+        <button type="button" class="btn btn-lg btn-primary" style="margin-top:1rem;width:100%" id="share-link-copy">${icon('copy')} Kopiuj link</button>
+        <p class="form-hint" style="margin-top:.9rem">Link nie wygasa sam. Możesz go cofnąć w „Konto → Moje udostępnienia fiszek”.</p>`,
+      onMount: (dlg) => {
+        $('#share-link-copy', dlg).addEventListener('click', async () => {
+          try { await navigator.clipboard.writeText(link); toast('Link skopiowany.'); } catch (e) { toast('Nie udało się skopiować. Zaznacz i skopiuj link ręcznie.', { ms: 7000 }); }
+        });
+      },
+    });
+  } catch (err) { dbError(err); closeSheet(); }
+}
+
+function renderShareImportError(message) {
+  openSheet({
+    title: 'Udostępnianie fiszek',
+    body: `<p class="text-muted" style="line-height:1.5">${esc(message)}</p>
+      <button type="button" class="btn btn-lg btn-primary" style="margin-top:1rem" data-act="sheet-close">Zamknij</button>`,
+  });
+}
+
+/** Odbiór paczki z linku #/udostepnij/{id}: pobiera dokument, waliduje TĄ SAMĄ funkcją co ręczny import. */
+async function openShareImport(shareId) {
+  openSheet({ title: 'Otrzymana paczka fiszek', body: '<p class="text-muted" style="padding:1rem 0">Wczytuję…</p>' });
+  let snap;
+  try {
+    snap = await getDoc(doc(db, 'shares', shareId));
+  } catch (err) {
+    console.error(err);
+    renderShareImportError('Nie udało się pobrać paczki. Sprawdź połączenie z internetem i spróbuj otworzyć link ponownie.');
+    return;
+  }
+  if (!$('#sheet').open) return; // arkusz zamknięty, zanim dane doszły – nie podmieniamy go pod użytkownikiem
+  if (!snap.exists()) { renderShareImportError('Ten link jest nieprawidłowy albo osoba, która go wysłała, cofnęła udostępnienie.'); return; }
+  const raw = snap.data();
+  const cards = Array.isArray(raw.cards) ? raw.cards : [];
+  const r = L.parseImport(JSON.stringify(cards), state.cards);
+  if (!r.ok) { renderShareImportError(`Ta paczka jest uszkodzona: ${r.error}`); return; }
+  if (!r.cards.length) {
+    openSheet({
+      title: 'Otrzymana paczka fiszek',
+      body: `<p class="text-muted">Wszystkie ${L.plural(cards.length, WORDS.card)} z tej paczki już masz.</p>
+        <button type="button" class="btn btn-lg btn-primary" style="margin-top:1rem" data-act="sheet-close">Zamknij</button>`,
+    });
+    return;
+  }
+  const path = L.commonPath(r.cards);
+  const dup = r.duplicates ? ` (plus ${L.plural(r.duplicates, ['duplikat', 'duplikaty', 'duplikatów'])}, które już masz – zostaną pominięte)` : '';
+  openSheet({
+    title: 'Otrzymana paczka fiszek',
+    body: `<p class="text-muted" style="line-height:1.5">Ktoś udostępnił Ci ${L.plural(r.cards.length, WORDS.card)}${dup}.</p>
+      ${path.subject ? `<p style="font-weight:600;margin-top:.5rem;overflow-wrap:anywhere">${esc(pathName(path))}</p>` : ''}
+      <button type="button" class="btn btn-lg btn-primary" style="margin-top:1.25rem;width:100%" id="share-import-go">${icon('download')} Dodaj do moich fiszek</button>
+      <button type="button" class="btn btn-lg btn-plain" style="margin-top:.5rem;width:100%" data-act="sheet-close">Anuluj</button>`,
+    onMount: (dlg) => {
+      $('#share-import-go', dlg).addEventListener('click', async () => {
+        const btn = $('#share-import-go', dlg);
+        btn.disabled = true;
+        btn.textContent = 'Zapisuję…';
+        try {
+          const base = Date.now();
+          await Promise.all(commitBatches(r.cards, (b, c, i) => b.set(doc(colRef('flashcards')), { ...c, createdAt: Timestamp.fromMillis(base + i) })));
+          closeSheet();
+          toast(`Dodano ${L.plural(r.cards.length, WORDS.card)} do Twoich fiszek.`, { ms: 7000 });
+          location.hash = cardsHash(path);
+        } catch (err) { dbError(err); btn.disabled = false; btn.textContent = 'Dodaj do moich fiszek'; }
+      });
+    },
+  });
+}
+
+function renderMySharesSheet(items) {
+  const sorted = [...items].sort((a, b) => (b.createdAtMs ?? 0) - (a.createdAtMs ?? 0));
+  const rows = sorted.map((it) => `<li class="card" style="display:flex;align-items:center;gap:.5rem;padding:.75rem 1rem">
+      <span style="flex:1;min-width:0"><span style="display:block;font-weight:600;overflow-wrap:anywhere">${esc(it.label || 'Fiszki')}</span>
+      <span class="text-muted" style="font-size:.85rem">${L.plural(it.cardCount || 0, WORDS.card)}</span></span>
+      <button type="button" class="icon-btn danger" data-act="fc-share-revoke" data-id="${esc(it.id)}" aria-label="Cofnij udostępnienie: ${esc(it.label || 'Fiszki')}">${icon('trash-2')}</button></li>`).join('');
+  openSheet({
+    title: 'Moje udostępnienia fiszek',
+    body: items.length ? `<ul class="space-y-2" role="list">${rows}</ul>` : '<p class="text-muted">Nie udostępniłeś jeszcze żadnych fiszek.</p>',
+  });
+}
+
+async function openMyShares() {
+  openSheet({ title: 'Moje udostępnienia fiszek', body: '<p class="text-muted" style="padding:1rem 0">Wczytuję…</p>' });
+  try {
+    const snap = await getDocs(colRef('shares_sent'));
+    renderMySharesSheet(snap.docs.map(mapDoc));
+  } catch (err) { dbError(err); closeSheet(); }
+}
+
+async function revokeShare(id) {
+  const ok = await confirmSheet({
+    title: 'Cofnąć udostępnienie?',
+    message: 'Link przestanie działać. Fiszki, które ktoś już zaimportował do siebie, zostaną u niego – to jego kopia.',
+    confirmLabel: 'Cofnij udostępnienie',
+  });
+  if (!ok) return;
+  try {
+    const batch = writeBatch(db);
+    batch.delete(doc(db, 'shares', id));
+    batch.delete(docRef('shares_sent', id));
+    await batch.commit();
+    toast('Cofnięto udostępnienie.');
+    openMyShares();
+  } catch (err) { dbError(err); }
+}
+
 // ================================================================== 10. NAUKA
 let study = null;
 const findCard = (id) => state.cards.find((c) => c.id === id);
@@ -944,6 +1247,7 @@ function openAccount() {
       <p class="form-hint" style="margin-bottom:1rem">${esc(label)}</p>
       <div style="display:flex;flex-direction:column;gap:.5rem">
         <button type="button" class="btn btn-lg btn-plain" data-act="backup">${icon('download')} Pobierz kopię zapasową</button>
+        <button type="button" class="btn btn-lg btn-plain" data-act="fc-my-shares">${icon('share-2')} Moje udostępnienia fiszek</button>
         <button type="button" class="btn btn-lg btn-danger" data-act="logout">${icon('log-out')} Wyloguj</button></div>
       <p class="text-muted" style="font-size:.8rem;margin-top:1rem">Life OS, wersja ${APP_VERSION}</p>`,
   });
@@ -1008,8 +1312,19 @@ function parseRoute() {
   return { name, path };
 }
 
+let lastHandledShare = null;
+
 function route() {
   if (!state.user) return;
+  const shareMatch = /^#\/udostepnij\/([^/]+)$/.exec(location.hash);
+  if (shareMatch) {
+    // Nie zmieniamy trasy pod spodem – arkusz z paczką po prostu otwiera się na wierzchu.
+    // Jeśli to pierwsza rzecz po zalogowaniu, trzeba jednak zamontować JAKIŚ widok (inaczej pusty ekran za arkuszem).
+    if (!state.route) { state.route = 'planer'; views.planer.mount(); views.planer.update(); updateNav(); }
+    const shareId = decodeURIComponent(shareMatch[1]);
+    if (lastHandledShare !== shareId) { lastHandledShare = shareId; openShareImport(shareId); }
+    return;
+  }
   const r = parseRoute();
   state.path = r.path;
   if (r.name !== state.route || !views[r.name].mounted) {
@@ -1082,6 +1397,12 @@ const actions = {
   'ta-prio': (el) => TasksView.cyclePriority(el.dataset.id),
   'ta-del': (el) => TasksView.remove(el.dataset.id),
   'ta-clear-done': () => TasksView.clearDone(),
+  'ta-switch-list': () => openListSwitcher(),
+  'ta-list-pick': (el) => { setCurrentList(el.dataset.id || null); closeSheet(); },
+  'ta-list-rename': (el) => openListRename(el.dataset.id),
+  'ta-list-del': (el) => deleteTaskList(el.dataset.id),
+  'ta-subtask-add': (el) => TasksView.startAddSubtask(el.dataset.id),
+  'ta-subtask-cancel': () => TasksView.cancelAddSubtask(),
   'fc-import': () => openImport(),
   'fc-new': () => openCardSheet(),
   'fc-edit': (el) => openCardSheet(el.dataset.id),
@@ -1098,6 +1419,9 @@ const actions = {
     deleteManyWithUndo('flashcards', items, `Usunięto ${L.plural(items.length, WORDS.card)}`);
   },
   'fc-study': (el) => startStudy(el.dataset.mode),
+  'fc-share': () => shareCurrentPath(),
+  'fc-my-shares': () => { closeSheet(); openMyShares(); },
+  'fc-share-revoke': (el) => revokeShare(el.dataset.id),
   'st-flip': () => flipCard(),
   'st-rate': (el) => rate(el.dataset.r),
   'st-close': () => closeStudy(),
@@ -1133,29 +1457,64 @@ const forms = {
     const input = f.title;
     const title = input.value.trim();
     if (!title) { input.focus(); return; }
-    addDoc(colRef('tasks'), { title, completed: false, priority: TasksView.prio, createdAt: serverTimestamp() }).catch(dbError);
+    addDoc(colRef('tasks'), {
+      title, completed: false, priority: TasksView.prio, createdAt: serverTimestamp(),
+      ...(state.currentListId ? { listId: state.currentListId } : {}),
+    }).catch(dbError);
     input.value = '';
     input.focus();
+  },
+
+  subtask: (f) => {
+    const title = String(new FormData(f).get('title') || '').trim();
+    if (!title) return;
+    addDoc(colRef('tasks'), {
+      title, completed: false, priority: 'medium', createdAt: serverTimestamp(), parentId: f.dataset.parent,
+      ...(state.currentListId ? { listId: state.currentListId } : {}),
+    }).catch(dbError);
+    TasksView.addingSubtaskFor = null;
+    scheduleRender();
+  },
+
+  tasklist: (f) => {
+    const name = String(new FormData(f).get('name') || '').trim();
+    const error = L.validateListName(name);
+    if (error) { showFormError(f, error); return; }
+    addDoc(colRef('task_lists'), { name, createdAt: serverTimestamp() })
+      .then((ref) => setCurrentList(ref.id))
+      .catch(dbError);
+    closeSheet();
+    toast('Utworzono listę');
+  },
+
+  'tasklist-rename': (f) => {
+    const name = String(new FormData(f).get('name') || '').trim();
+    const error = L.validateListName(name);
+    if (error) { showFormError(f, error); return; }
+    updateDoc(docRef('task_lists', f.dataset.id), { name }).catch(dbError);
+    closeSheet();
+    toast('Zmieniono nazwę listy');
   },
 
   event: (f) => {
     const fd = new FormData(f);
     const allDay = fd.get('allDay') === '1';
     const title = String(fd.get('title') || '').trim();
+    const description = String(fd.get('description') || '').trim();
     const date = fd.get('date');
     const colorCode = L.safeColor(fd.get('color') || L.DEFAULT_EVENT_COLOR);
     let data;
     if (allDay) {
       const endDate = fd.get('endDate') || date;
-      const error = L.validateEvent({ title, date, allDay: true, endDate });
+      const error = L.validateEvent({ title, date, allDay: true, endDate, description });
       if (error) { showFormError(f, error); return; }
-      data = { title, date, allDay: true, endDate, days: L.expandDays(date, endDate), colorCode };
+      data = { title, date, allDay: true, endDate, days: L.expandDays(date, endDate), colorCode, ...(description ? { description } : {}) };
     } else {
       const startTime = fd.get('start');
       const endTime = fd.get('end');
-      const error = L.validateEvent({ title, date, startTime, endTime });
+      const error = L.validateEvent({ title, date, startTime, endTime, description });
       if (error) { showFormError(f, error); return; }
-      data = { title, date, startTime, endTime, colorCode };
+      data = { title, date, startTime, endTime, colorCode, ...(description ? { description } : {}) };
     }
     const id = f.dataset.id;
     // setDoc (pełne nadpisanie), NIE updateDoc: przy przełączeniu godzinowe ⇄ całodniowe w bazie

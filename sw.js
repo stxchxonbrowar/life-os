@@ -16,7 +16,7 @@
  * zostanie usunięty.
  * ========================================================================== */
 
-const VERSION = 'v1.1.0';
+const VERSION = 'v1.2.0';
 const SHELL_CACHE = `lifeos-shell-${VERSION}`;
 const RUNTIME_CACHE = `lifeos-runtime-${VERSION}`;
 

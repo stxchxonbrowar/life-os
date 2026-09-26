@@ -79,15 +79,48 @@ service cloud.firestore {
     function optionalTimestamp(d, k) {
       return !(k in d) || d[k] == null || d[k] is timestamp;
     }
+    // Pole opcjonalne, ale JEŚLI występuje, musi być poprawnym niepustym tekstem.
+    // Puste pole aplikacja po prostu pomija przy zapisie (nigdy nie zapisuje "").
+    function optionalText(d, k, max) {
+      return !(k in d) || text(d[k], max);
+    }
+    // Referencja do innego dokumentu w TEJ SAMEJ kolekcji (id listy / id zadania nadrzędnego).
+    function optionalRef(d, k) {
+      return !(k in d) || (d[k] is string && d[k].size() > 0 && d[k].size() <= 200);
+    }
+    function effectiveListId(d) {
+      return d.get('listId', null);
+    }
 
     function validTask(d) {
       return d.keys().hasAll(['title', 'completed', 'priority'])
         // hasOnly (nie tylko limit liczby pól!) - żadne inne pole nie może się
         // "podszyć" pod dozwolone, zajmując miejsce np. createdAt.
-        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt'])
+        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt', 'listId', 'parentId'])
         && text(d.title, 300)
         && d.completed is bool
         && d.priority in ['low', 'medium', 'high']
+        && optionalTimestamp(d, 'createdAt')
+        && optionalRef(d, 'listId')
+        && optionalRef(d, 'parentId');
+    }
+
+    // Zadanie z parentId musi realnie wskazywać na INNE, ISTNIEJĄCE zadanie z TEJ SAMEJ
+    // listy, które samo NIE JEST podzadaniem – to wymusza w bazie (nie tylko w aplikacji)
+    // maksymalnie jeden poziom zagnieżdżenia, tak jak w Google Tasks.
+    function validParentRef(uid, id, d) {
+      return !('parentId' in d) || (
+        d.parentId != id
+        && exists(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId))
+        && get(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId)).data.get('parentId', null) == null
+        && get(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId)).data.get('listId', null) == effectiveListId(d)
+      );
+    }
+
+    function validTaskList(d) {
+      return d.keys().hasAll(['name'])
+        && d.keys().hasOnly(['name', 'createdAt'])
+        && text(d.name, 60)
         && optionalTimestamp(d, 'createdAt');
     }
 
@@ -98,8 +131,9 @@ service cloud.firestore {
     function validEvent(d) {
       return d.keys().hasAll(['title', 'date', 'colorCode'])
         // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
-        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days'])
+        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days', 'description'])
         && text(d.title, 200)
+        && optionalText(d, 'description', 2000)
         && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
         && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$')
         && (
@@ -136,7 +170,19 @@ service cloud.firestore {
 
     match /users/{uid}/tasks/{id} {
       allow read, delete: if isOwner(uid);
-      allow create, update: if isOwner(uid) && validTask(request.resource.data);
+      allow create: if isOwner(uid) && validTask(request.resource.data) && validParentRef(uid, id, request.resource.data);
+      // Update: pełne (kosztowne - get()) sprawdzenie rodzica tylko, gdy parentId
+      // faktycznie się zmienia. Zwykłe odhaczenie/zmiana priorytetu/nazwy istniejącego
+      // podzadania NIE jest wtedy blokowane, nawet gdyby rodzic zniknął w jakiś inny
+      // sposób (np. ręczna edycja danych) – skasować taki "sierocy" wpis zawsze można
+      // (allow delete wyżej), więc to nigdy nie jest ślepy zaułek dla użytkownika.
+      allow update: if isOwner(uid) && validTask(request.resource.data)
+        && (request.resource.data.get('parentId', null) == resource.data.get('parentId', null)
+            || validParentRef(uid, id, request.resource.data));
+    }
+    match /users/{uid}/task_lists/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid) && validTaskList(request.resource.data);
     }
     match /users/{uid}/planner_events/{id} {
       allow read, delete: if isOwner(uid);
@@ -146,16 +192,58 @@ service cloud.firestore {
       allow read, delete: if isOwner(uid);
       allow create, update: if isOwner(uid) && validCard(request.resource.data);
     }
+
+    // ---------------------------------------------------- UDOSTĘPNIANIE FISZEK
+    // Paczka fiszek do przekazania innemu kontu. Celowo NIE walidujemy tu treści
+    // każdej fiszki tak surowo jak w validCard: prawdziwą bramką bezpieczeństwa jest
+    // miejsce, w które dane faktycznie trafiają - własna kolekcja `flashcards`
+    // odbiorcy - a ta ma już pełną walidację (hasOnly + limity długości) powyżej.
+    // `shares` to tylko nieedytowalny, ograniczony rozmiarem "schowek" do jednorazowego
+    // pobrania po znanym (niezgadywalnym) ID; nie da się go wylistować.
+    function validShare(d) {
+      return d.keys().hasAll(['ownerUid', 'createdAt', 'cards'])
+        && d.keys().hasOnly(['ownerUid', 'createdAt', 'cards'])
+        && d.ownerUid is string && d.ownerUid == request.auth.uid
+        && d.createdAt is timestamp
+        && d.cards is list && d.cards.size() >= 1 && d.cards.size() <= 100;
+    }
+    match /shares/{id} {
+      allow get: if request.auth != null;
+      allow list: if false;
+      allow create: if request.auth != null && validShare(request.resource.data);
+      allow update: if false; // udostępnienia są niezmienne - poprawka to nowy dokument
+      allow delete: if request.auth != null && request.auth.uid == resource.data.ownerUid;
+    }
+
+    // Wskaźnik "to ja to udostępniłem/am" - żeby właściciel mógł zobaczyć listę
+    // swoich udostępnień i je cofnąć (skasować dokument w `shares`), mimo że
+    // `shares` samo w sobie nie da się przeglądać (allow list: false powyżej).
+    function validSharePointer(d) {
+      return d.keys().hasAll(['cardCount', 'createdAt'])
+        && d.keys().hasOnly(['cardCount', 'createdAt', 'label'])
+        && d.cardCount is int && d.cardCount >= 1 && d.cardCount <= 100
+        && optionalTimestamp(d, 'createdAt')
+        && optionalText(d, 'label', 200);
+    }
+    match /users/{uid}/shares_sent/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && validSharePointer(request.resource.data);
+      allow update: if false;
+    }
   }
 }
 ```
 
+**Ważne, jeśli aktualizujesz z poprzedniej wersji:** te reguły różnią się od poprzednich (dochodzą listy zadań, podzadania, opis wydarzenia i udostępnianie fiszek). Samo wgranie nowych plików aplikacji do repozytorium NIE wystarczy — musisz też wkleić powyższy blok w **Firestore Database → Rules** i kliknąć **Publish** (krok 5 raz jeszcze), inaczej nowe funkcje będą zgłaszać „Brak uprawnień do zapisu/odczytu”, bo baza dalej pilnuje starego kształtu danych.
+
 Co te reguły robią:
 - Zalogowany użytkownik widzi i zmienia wyłącznie swoje dane (`users/{jego-id}/...`). Niezalogowani i inni użytkownicy nie mają dostępu do niczego.
-- Baza odrzuca dane w złym formacie (zły priorytet, godzina 25:00, pusty tytuł, za długi tekst, wydarzenie całodniowe dłuższe niż 60 dni).
-- Wydarzenie musi być *albo* godzinowe, *albo* całodniowe — nigdy oba naraz i nigdy żadne z nich niepełne.
+- Baza odrzuca dane w złym formacie (zły priorytet, godzina 25:00, pusty tytuł, za długi tekst, wydarzenie całodniowe dłuższe niż 60 dni, opis dłuższy niż 2000 znaków).
+- Wydarzenie musi być *albo* godzinowe, *albo* całodniowe — nigdy oba naraz i nigdy żadne z nich niepełne. Opis jest zawsze opcjonalny.
+- Podzadanie musi wskazywać na istniejące zadanie z tej samej listy, które samo nie jest podzadaniem — baza pilnuje jednego poziomu zagnieżdżenia, nie tylko aplikacja. Zwykła zmiana (np. odhaczenie) podzadania, którego rodzic zniknął, dalej działa — zablokowana jest tylko próba *ustawienia* nieprawidłowego rodzica.
 - `hasOnly` pilnuje, żeby dokument nie miał żadnych dodatkowych, niespodziewanych pól — nie tylko ich liczby, ale i nazw.
-- Wszystko poza trzema kolekcjami (zadania, wydarzenia, fiszki) jest zamknięte.
+- Udostępniona paczka fiszek (`shares/{id}`) jest niezmienna, ograniczona do 100 fiszek, nie da się jej wylistować (dostęp tylko po znanym ID) i tylko właściciel może ją skasować (cofnąć udostępnienie).
+- Wszystko poza tymi kolekcjami (zadania, listy zadań, wydarzenia, fiszki, udostępnienia) jest zamknięte.
 
 ## Krok 6: Konfiguracja aplikacji
 
@@ -192,11 +280,13 @@ Loguj się tym samym kontem na każdym urządzeniu. Dane synchronizują się na 
 
 ## Krok 9: Codzienne użycie
 
-**Planer.** Dotknij osi czasu w miejscu godziny albo kliknij „Dodaj”. Dotknięcie wydarzenia otwiera edycję i usuwanie. Strzałki i data na dole zmieniają dzień. Czerwona linia to bieżąca godzina. Przełącznik „Dzień / Miesiąc” u góry pokazuje całą siatkę kalendarza — kropki przy numerze dnia to liczba wydarzeń, dotknięcie dnia otwiera go w widoku dnia. W formularzu wydarzenia przełącznik „Godzinowe / Całodniowe” pozwala dodać wydarzenie trwające kilka dni (np. rejs) — pokazuje się wtedy jako osobny pasek nad osią czasu w widoku dnia, na każdym dniu, który obejmuje.
+**Planer.** Dotknij osi czasu w miejscu godziny albo kliknij „Dodaj”. Formularz ma pole tytułu i osobne pole „Opis (opcjonalnie)” — opis mieści do 2000 znaków i pokazuje się pod tytułem zarówno w widoku dnia, jak i na pasku wydarzenia całodniowego (skrócony do dwóch linii). Dotknięcie wydarzenia otwiera edycję i usuwanie. Strzałki i data na dole zmieniają dzień. Czerwona linia to bieżąca godzina. Przełącznik „Dzień / Miesiąc” u góry pokazuje całą siatkę kalendarza — zamiast samej kropki przy dniu widać teraz **tytuł wydarzenia**, podświetlony kolorem, jaki mu nadałeś (do trzech na dzień, reszta jako „+N więcej”); dotknięcie dnia otwiera go w widoku dnia. W formularzu wydarzenia przełącznik „Godzinowe / Całodniowe” pozwala dodać wydarzenie trwające kilka dni (np. rejs) — pokazuje się wtedy jako osobny pasek nad osią czasu w widoku dnia, na każdym dniu, który obejmuje.
 
-**Zadania.** Pole na dole ekranu. Kolorowa etykieta obok pola ustawia priorytet nowego zadania, a dotknięcie etykiety przy zadaniu zmienia jego priorytet. Usuwanie ma przycisk „Cofnij”.
+**Zadania.** Pole na dole ekranu. Kolorowa etykieta obok pola ustawia priorytet nowego zadania, a dotknięcie etykiety przy zadaniu zmienia jego priorytet. Usuwanie ma przycisk „Cofnij” (kasuje też podzadania danego zadania). Przycisk z nazwą listy u góry (np. „Zadania ▾”) otwiera przełącznik list — wzorem Kalendarza/Zadań Google możesz tworzyć zupełnie osobne, niezależne listy (np. „Dom”, „Statek”, „Stachu — szkoła”), przełączać się między nimi, zmieniać nazwę i kasować całą listę razem z jej zadaniami (też z „Cofnij”). Aplikacja pamięta, na której liście byłeś, nawet po zamknięciu. Każde zadanie może mieć podzadania — przycisk „+” przy zadaniu otwiera mały formularz dodania podzadania; wspierany jest tylko jeden poziom zagnieżdżenia (tak jak w Google Tasks — podzadania nie mają własnych podzadań). „Usuń ukończone” działa tylko na aktualnie otwartej liście, nie rusza pozostałych.
 
 **Fiszki.** Przycisk „Importuj z AI” otwiera okno, w którym jest przycisk „Kopiuj prompt dla Claude”. Wklejasz prompt do rozmowy z Claude, uzupełniasz pola w `[[ ]]`, a odpowiedź wklejasz z powrotem. Aplikacja sprawdza dane na bieżąco. Jeśli w JSON-ie jest błąd, nic się nie zapisuje i widzisz, co poprawić. **Sprawdzaj treść fiszek przed importem**: AI potrafi podać z przekonaniem błędną liczbę albo numer przepisu.
+
+**Udostępnianie fiszek.** W widoku fiszek, wewnątrz dowolnego przedmiotu/tematu/zagadnienia, przycisk „Udostępnij” tworzy link i pokazuje go do skopiowania. To jest **jednorazowa kopia, nie żywa synchronizacja** — druga osoba (np. Stachu, na swoim koncie) otwiera link, loguje się na swoje konto i widzi podgląd paczki z przyciskiem „Dodaj do moich fiszek”; od tej chwili to już jej własne, niezależne fiszki (Twoje dalsze zmiany się tam nie pojawią, i odwrotnie). Limit to 100 fiszek na jedno udostępnienie — przy większym dziale podziel je i udostępnij węższy zakres (np. jedno zagadnienie zamiast całego przedmiotu). Link nie wygasa sam, ale w „Ikona konta → Moje udostępnienia fiszek” widzisz listę wszystkiego, co udostępniłeś, i możesz cofnąć dowolne udostępnienie w każdej chwili — po cofnięciu link przestaje działać (osoby, które już zaimportowały paczkę wcześniej, zachowują swoją kopię).
 
 **Nauka.** Dotknij fiszki albo „Pokaż odpowiedź”. Po obrocie oceń: Trudne (wraca jeszcze dziś, także w tej sesji), Dobre (za 3 dni), Łatwe (za 7 dni). Na klawiaturze: Spacja lub Enter obraca, klawisze 1, 2, 3 oceniają.
 
@@ -204,7 +294,7 @@ Loguj się tym samym kontem na każdym urządzeniu. Dane synchronizują się na 
 
 **Limity darmowego planu** (dokumentacja Firestore): 1 GiB danych, 50 000 odczytów, 20 000 zapisów i 20 000 usunięć dziennie, 10 GiB transferu miesięcznie. Dla użytku osobistego to duży zapas. Limity dzienne zerują się o północy czasu pacyficznego, czyli u nas około 9:00 rano. Na planie Spark bez karty nic Ci nie naliczą, a po przekroczeniu limitu zapisy czekają do resetu.
 
-**Aktualizacja aplikacji.** Gdy dostaniesz nową paczkę, w repozytorium kliknij **Add file, Upload files**, przeciągnij pliki (nadpiszą stare) i kliknij **Commit changes**. Odczekaj 1 do 3 minut. Nowa wersja pojawi się przy **drugim** otwarciu aplikacji, bo pierwsze otwarcie pobiera ją w tle.
+**Aktualizacja aplikacji.** Gdy dostaniesz nową paczkę, w repozytorium kliknij **Add file, Upload files**, przeciągnij pliki (nadpiszą stare) i kliknij **Commit changes**. Odczekaj 1 do 3 minut. Nowa wersja pojawi się przy **drugim** otwarciu aplikacji, bo pierwsze otwarcie pobiera ją w tle. **Jeśli paczka zawiera nowy `firestore.rules`** (tak jak ta) — a poznasz to po tym, że w informacji o zmianach jest o tym mowa — wklej go też w Firebase, **Firestore Database → Rules → Publish** (krok 5). Same pliki na GitHubie nowych reguł nie publikują; bez tego kroku nowe funkcje będą zgłaszać błąd braku uprawnień.
 
 ## Krok 10: Problemy
 
@@ -279,11 +369,18 @@ FORMAT ODPOWIEDZI:
 - 37 testów reguł bezpieczeństwa (poprzednie 19, przeliczone pod nowy kształt danych, + 18 nowych dla wydarzeń całodniowych/wielodniowych). Przy tej okazji reguły zostały dokręcone: limit liczby pól sam w sobie pozwalał podstawić 1–2 nieznane pola w miejsce opcjonalnych — teraz reguły sprawdzają dokładny zestaw dozwolonych nazw pól (`hasOnly`), nie tylko ich liczbę.
 - 27 nowych scenariuszy end-to-end dla widoku miesiąca i wydarzeń wielodniowych: przełączanie dzień/miesiąc, nawigacja między miesiącami i powrót do bieżącego, dodanie wydarzenia całodniowego rozciągniętego na kilka dni, widoczność jako kropka na każdym objętym dniu siatki, przejście z siatki do widoku dnia, edycja z zamianą godzinowe ⇄ całodniowe (i odwrotnie) bez pozostawiania „starych” pól w bazie, usunięcie. Test dostępności axe powtórzony dla nowego widoku i formularza z przełącznikiem — przy okazji wykryto i poprawiono jeden realny błąd kontrastu (przygaszone dni spoza miesiąca w siatce), zanim trafił na Twój telefon.
 
+**Aktualizacja — opis wydarzenia, tytuły w widoku miesiąca, listy zadań, podzadania, udostępnianie fiszek:**
+- 67 testów logiki (41 poprzednich, bez zmian + 26 nowych): opis wydarzenia w obu kształtach wydarzenia, nazwa listy zadań, filtrowanie zadań po liście, budowa drzewa zadanie→podzadania (w tym „osierocone” podzadanie, które nigdy nie znika, tylko wraca na najwyższy poziom, i poprawna kolejność sortowania), przygotowanie i limit rozmiaru paczki do udostępnienia.
+- 82 testy reguł bezpieczeństwa (poprzednie 37 + 45 nowych): opis wydarzenia, `listId`/`parentId` zadania, w tym cała logika `validParentRef` — odrzucenie zadania wskazującego samo siebie, nieistniejącego rodzica, rodzica z innej listy i drugiego poziomu zagnieżdżenia — oraz jawnie sprawdzony przypadek "osieroconego" podzadania: zwykła aktualizacja (np. odhaczenie) dalej działa, ale próba nadania mu nowego, złego rodzica jest blokowana; nowa kolekcja list zadań; kolekcja `shares` (limit 100 fiszek, brak możliwości wylistowania, kasowanie tylko przez właściciela) i `shares_sent`.
+- 40 testów end-to-end (poprzednie 27, doszły: listy zadań — tworzenie, przełączanie, izolacja danych między listami, zmiana nazwy, kasowanie z kasowaniem zadań; podzadania — dodanie, zagnieżdżenie, brak podwójnego zagnieżdżenia, kasowanie razem z rodzicem; opis wydarzenia — dodanie, wyświetlanie, wypełnienie przy edycji; tytuły w widoku miesiąca zamiast kropek; **prawdziwe udostępnienie fiszek między dwoma kontami** na emulatorze (konto A tworzy i udostępnia, konto B loguje się z linku, widzi podgląd, importuje, fiszka pojawia się u B; konto A cofa udostępnienie i ten sam link przestaje działać). Dwa wcześniejsze wyniki axe okazały się fałszywymi alarmami spowodowanymi animacją otwierania okna w trakcie skanu (nie błędem aplikacji) — potwierdzone powtórnymi przebiegami; poprawiony został sam test (dodane odczekanie na koniec animacji), nie aplikacja.
+- Zanim jakikolwiek test w ogóle poszedł, przy pisaniu reguł i kodu wyłapałem i poprawiłem sam dwie rzeczy, które inaczej byłyby realnymi błędami: (1) reguła dla podzadań pierwotnie sprawdzałaby rodzica przy KAŻDEJ aktualizacji, co zablokowałoby na stałe odznaczanie ukończenia „osieroconego” podzadania — poprawione tak, by pełne sprawdzenie uruchamiało się tylko przy realnej zmianie rodzica; (2) „Usuń ukończone” działało globalnie na wszystkich zadaniach, więc po wprowadzeniu wielu list kasowałoby ukończone zadania też z list, których akurat nie oglądasz — poprawione, żeby działało tylko na aktualnie otwartej liście.
+
 **Niesprawdzone:**
 - Prawdziwy projekt Firebase. Testy szły na emulatorze. Pierwsze logowanie na Twoim projekcie to pierwszy test z prawdziwą chmurą.
 - iPhone i Safari, Firefox.
 - Prawdziwy GitHub Pages i wysyłka e-maila z resetem hasła.
 - Czytnik ekranu (sprawdziłem tylko automatem i klawiaturą).
 - Wydarzenie całodniowe trwające dokładnie na granicy 60 dni na żywym, nie-emulowanym Firestore (logika jest przetestowana, ale nie na prawdziwej bazie).
+- Udostępnianie fiszek między dwoma PRAWDZIWYMI kontami na Twoim rzeczywistym projekcie Firebase (testowałem na emulatorze z dwoma kontami testowymi — mechanizm jest ten sam, ale to nie jest to samo co Twój żywy projekt).
 
-**Ograniczenia:** brak powiadomień push. Styl Tailwind ładuje się z internetu (wymóg specyfikacji), więc pierwsze uruchomienie wymaga sieci. Kolor paska stanu na iPhonie nie zmienia się razem z motywem. Widok miesiąca dociąga dane maksymalnie 60 dni wstecz od pierwszego dnia siatki (żeby złapać wydarzenia wielodniowe zaczęte wcześniej) — to więcej odczytów niż w widoku dnia, ale wciąż daleko poniżej darmowego limitu przy normalnym użyciu.
+**Ograniczenia:** brak powiadomień push. Styl Tailwind ładuje się z internetu (wymóg specyfikacji), więc pierwsze uruchomienie wymaga sieci. Kolor paska stanu na iPhonie nie zmienia się razem z motywem. Widok miesiąca dociąga dane maksymalnie 60 dni wstecz od pierwszego dnia siatki (żeby złapać wydarzenia wielodniowe zaczęte wcześniej) — to więcej odczytów niż w widoku dnia, ale wciąż daleko poniżej darmowego limitu przy normalnym użyciu. Udostępnianie fiszek to **jednorazowa kopia, nie żywa synchronizacja** — po imporcie odbiorca ma niezależną kopię, dalsze zmiany w żadną stronę się nie przenoszą; limit to 100 fiszek na jedno udostępnienie (to techniczny limit rozmiaru pojedynczego dokumentu w Firestore, 1 MiB); udostępnienia nie wygasają same z czasem, ale można je cofnąć ręcznie w każdej chwili. Podzadania wspierają tylko jeden poziom zagnieżdżenia (jak w Google Tasks) — podzadanie nie może mieć własnego podzadania.

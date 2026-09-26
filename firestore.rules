@@ -13,15 +13,48 @@ service cloud.firestore {
     function optionalTimestamp(d, k) {
       return !(k in d) || d[k] == null || d[k] is timestamp;
     }
+    // Pole opcjonalne, ale JEŚLI występuje, musi być poprawnym niepustym tekstem.
+    // Puste pole aplikacja po prostu pomija przy zapisie (nigdy nie zapisuje "").
+    function optionalText(d, k, max) {
+      return !(k in d) || text(d[k], max);
+    }
+    // Referencja do innego dokumentu w TEJ SAMEJ kolekcji (id listy / id zadania nadrzędnego).
+    function optionalRef(d, k) {
+      return !(k in d) || (d[k] is string && d[k].size() > 0 && d[k].size() <= 200);
+    }
+    function effectiveListId(d) {
+      return d.get('listId', null);
+    }
 
     function validTask(d) {
       return d.keys().hasAll(['title', 'completed', 'priority'])
         // hasOnly (nie tylko limit liczby pól!) - żadne inne pole nie może się
         // "podszyć" pod dozwolone, zajmując miejsce np. createdAt.
-        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt'])
+        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt', 'listId', 'parentId'])
         && text(d.title, 300)
         && d.completed is bool
         && d.priority in ['low', 'medium', 'high']
+        && optionalTimestamp(d, 'createdAt')
+        && optionalRef(d, 'listId')
+        && optionalRef(d, 'parentId');
+    }
+
+    // Zadanie z parentId musi realnie wskazywać na INNE, ISTNIEJĄCE zadanie z TEJ SAMEJ
+    // listy, które samo NIE JEST podzadaniem – to wymusza w bazie (nie tylko w aplikacji)
+    // maksymalnie jeden poziom zagnieżdżenia, tak jak w Google Tasks.
+    function validParentRef(uid, id, d) {
+      return !('parentId' in d) || (
+        d.parentId != id
+        && exists(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId))
+        && get(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId)).data.get('parentId', null) == null
+        && get(/databases/$(database)/documents/users/$(uid)/tasks/$(d.parentId)).data.get('listId', null) == effectiveListId(d)
+      );
+    }
+
+    function validTaskList(d) {
+      return d.keys().hasAll(['name'])
+        && d.keys().hasOnly(['name', 'createdAt'])
+        && text(d.name, 60)
         && optionalTimestamp(d, 'createdAt');
     }
 
@@ -32,8 +65,9 @@ service cloud.firestore {
     function validEvent(d) {
       return d.keys().hasAll(['title', 'date', 'colorCode'])
         // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
-        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days'])
+        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days', 'description'])
         && text(d.title, 200)
+        && optionalText(d, 'description', 2000)
         && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
         && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$')
         && (
@@ -70,7 +104,19 @@ service cloud.firestore {
 
     match /users/{uid}/tasks/{id} {
       allow read, delete: if isOwner(uid);
-      allow create, update: if isOwner(uid) && validTask(request.resource.data);
+      allow create: if isOwner(uid) && validTask(request.resource.data) && validParentRef(uid, id, request.resource.data);
+      // Update: pełne (kosztowne - get()) sprawdzenie rodzica tylko, gdy parentId
+      // faktycznie się zmienia. Zwykłe odhaczenie/zmiana priorytetu/nazwy istniejącego
+      // podzadania NIE jest wtedy blokowane, nawet gdyby rodzic zniknął w jakiś inny
+      // sposób (np. ręczna edycja danych) – skasować taki "sierocy" wpis zawsze można
+      // (allow delete wyżej), więc to nigdy nie jest ślepy zaułek dla użytkownika.
+      allow update: if isOwner(uid) && validTask(request.resource.data)
+        && (request.resource.data.get('parentId', null) == resource.data.get('parentId', null)
+            || validParentRef(uid, id, request.resource.data));
+    }
+    match /users/{uid}/task_lists/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid) && validTaskList(request.resource.data);
     }
     match /users/{uid}/planner_events/{id} {
       allow read, delete: if isOwner(uid);
@@ -79,6 +125,44 @@ service cloud.firestore {
     match /users/{uid}/flashcards/{id} {
       allow read, delete: if isOwner(uid);
       allow create, update: if isOwner(uid) && validCard(request.resource.data);
+    }
+
+    // ---------------------------------------------------- UDOSTĘPNIANIE FISZEK
+    // Paczka fiszek do przekazania innemu kontu. Celowo NIE walidujemy tu treści
+    // każdej fiszki tak surowo jak w validCard: prawdziwą bramką bezpieczeństwa jest
+    // miejsce, w które dane faktycznie trafiają - własna kolekcja `flashcards`
+    // odbiorcy - a ta ma już pełną walidację (hasOnly + limity długości) powyżej.
+    // `shares` to tylko nieedytowalny, ograniczony rozmiarem "schowek" do jednorazowego
+    // pobrania po znanym (niezgadywalnym) ID; nie da się go wylistować.
+    function validShare(d) {
+      return d.keys().hasAll(['ownerUid', 'createdAt', 'cards'])
+        && d.keys().hasOnly(['ownerUid', 'createdAt', 'cards'])
+        && d.ownerUid is string && d.ownerUid == request.auth.uid
+        && d.createdAt is timestamp
+        && d.cards is list && d.cards.size() >= 1 && d.cards.size() <= 100;
+    }
+    match /shares/{id} {
+      allow get: if request.auth != null;
+      allow list: if false;
+      allow create: if request.auth != null && validShare(request.resource.data);
+      allow update: if false; // udostępnienia są niezmienne - poprawka to nowy dokument
+      allow delete: if request.auth != null && request.auth.uid == resource.data.ownerUid;
+    }
+
+    // Wskaźnik "to ja to udostępniłem/am" - żeby właściciel mógł zobaczyć listę
+    // swoich udostępnień i je cofnąć (skasować dokument w `shares`), mimo że
+    // `shares` samo w sobie nie da się przeglądać (allow list: false powyżej).
+    function validSharePointer(d) {
+      return d.keys().hasAll(['cardCount', 'createdAt'])
+        && d.keys().hasOnly(['cardCount', 'createdAt', 'label'])
+        && d.cardCount is int && d.cardCount >= 1 && d.cardCount <= 100
+        && optionalTimestamp(d, 'createdAt')
+        && optionalText(d, 'label', 200);
+    }
+    match /users/{uid}/shares_sent/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create: if isOwner(uid) && validSharePointer(request.resource.data);
+      allow update: if false;
     }
   }
 }

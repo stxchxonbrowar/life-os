@@ -234,6 +234,7 @@
   .dark .ev:hover { filter: brightness(1.2); }
   .ev-title { display: block; font-weight: 600; font-size: .875rem; line-height: 1.2; overflow-wrap: anywhere; }
   .ev-time { display: block; font-size: .75rem; color: rgb(var(--muted)); font-variant-numeric: tabular-nums; }
+  .ev-desc { display: block; font-size: .72rem; line-height: 1.3; color: rgb(var(--muted)); margin-top: 1px; overflow-wrap: anywhere; }
   .ev-compact { display: flex; gap: .5rem; align-items: baseline; }
   .ev-compact .ev-title { white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .ev-compact .ev-time { flex: none; }
@@ -289,8 +290,8 @@
   .mg-head { text-align: center; font-size: .75rem; font-weight: 700; color: rgb(var(--muted)); padding-bottom: .5rem; text-transform: uppercase; }
   .mg-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 3px; }
   .mg-day {
-    position: relative; aspect-ratio: 1 / 1; min-height: 44px; border-radius: .7rem; cursor: pointer;
-    display: flex; flex-direction: column; align-items: center; justify-content: flex-start; gap: 2px; padding: .35rem 0 0;
+    position: relative; min-width: 0; min-height: 5.75rem; border-radius: .7rem; cursor: pointer;
+    display: flex; flex-direction: column; align-items: center; gap: 2px; padding: .35rem .25rem .35rem;
     background: rgb(var(--fg) / .03); color: rgb(var(--fg)); transition: background-color .2s;
   }
   .mg-day:hover { background: rgb(var(--fg) / .07); }
@@ -298,15 +299,22 @@
      kontrast tekstu spadał do ~2:1 (wykryte testem axe-core, próg WCAG AA to 4.5:1).
      Sam kolor --muted (bez opacity) ma kontrast ok. 6:1, więc jest w pełni czytelny. */
   .mg-day.mg-out .mg-num { color: rgb(var(--muted)); }
-  .mg-num { font-size: .85rem; font-variant-numeric: tabular-nums; font-weight: 600; }
+  .mg-num { flex: none; font-size: .85rem; font-variant-numeric: tabular-nums; font-weight: 600; }
   .mg-day.mg-today .mg-num {
     display: inline-grid; place-items: center; width: 1.5rem; height: 1.5rem; border-radius: 50%;
     background: rgb(var(--brand)); color: rgb(var(--on-brand));
   }
   .mg-day.mg-selected { box-shadow: inset 0 0 0 2px rgb(var(--brand)); }
-  .mg-dots { display: flex; align-items: center; gap: 2px; }
-  .mg-dot { width: 5px; height: 5px; border-radius: 50%; flex: none; }
-  .mg-more { font-size: .6rem; font-weight: 700; color: rgb(var(--muted)); }
+  /* Tytuły wydarzeń zamiast kropek: tło i lewy pasek w kolorze wydarzenia, tekst w
+     kolorze motywu (ten sam schemat co .ev/.allday-chip – już przeszedł audyt axe-core,
+     bo tekst nigdy nie jest rysowany kolorem wydarzenia, tylko podświetlany jego tłem). */
+  .mg-events { display: flex; flex-direction: column; gap: 2px; width: 100%; align-self: stretch; min-width: 0; margin-top: 1px; }
+  .mg-chip {
+    display: block; width: 100%; min-width: 0; padding: 1px .3rem; border-radius: .3rem; border-left: 3px solid;
+    font-size: .62rem; line-height: 1.4; font-weight: 700; text-align: left; color: rgb(var(--fg));
+    white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  }
+  .mg-more { font-size: .6rem; font-weight: 700; color: rgb(var(--muted)); text-align: left; align-self: flex-start; padding-left: .3rem; }
 
   /* ---------------------------------------------------------------- ZADANIA */
   .check-wrap { position: relative; width: 44px; height: 44px; display: grid; place-items: center; cursor: pointer; flex: none; }
@@ -319,6 +327,9 @@
   .check-in:checked + .check-box .ic { opacity: 1; }
   .check-in:focus-visible + .check-box { outline: 2px solid rgb(var(--brand)); outline-offset: 3px; }
   .task-done { text-decoration: line-through; color: rgb(var(--muted)); }
+  .task-sub { margin-left: 1.75rem; width: calc(100% - 1.75rem); background: rgb(var(--fg) / .025); font-size: .92rem; }
+  .task-sub .check-wrap { width: 38px; height: 38px; }
+  .task-sub .check-box { width: 1.3rem; height: 1.3rem; }
 
   /* ------------------------------------------------------- ARKUSZ / MODAL */
   dialog.sheet {

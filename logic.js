@@ -12,6 +12,9 @@ export const DAY_END_MIN = 24 * 60 - 1;       // 23:59 – koniec osi czasu
 export const LAST_START_MIN = 23 * 60 + 45;   // najpóźniejszy start klikniętego wydarzenia
 export const MAX_IMPORT = 1000;               // maks. liczba fiszek w jednym imporcie
 export const MAX_ALLDAY_SPAN_DAYS = 60;       // maks. długość wydarzenia całodniowego (dni)
+export const MAX_EVENT_DESC = 2000;           // maks. długość opisu wydarzenia
+export const MAX_LIST_NAME = 60;              // maks. długość nazwy listy zadań
+export const MAX_SHARE_CARDS = 100;           // maks. liczba fiszek w jednej paczce do udostępnienia
 export const WEEKDAY_LABELS_PL = ['pon', 'wt', 'śr', 'czw', 'pt', 'sob', 'niedz'];
 
 export const PRIORITIES = ['low', 'medium', 'high'];
@@ -213,8 +216,9 @@ export function pxToMinutes(px, hourPx, snap = 15) {
  * Walidacja formularza wydarzenia — godzinowego albo całodniowego (allDay: true).
  * Zwraca komunikat błędu albo null.
  */
-export function validateEvent({ title, date, allDay, startTime, endTime, endDate }) {
+export function validateEvent({ title, date, allDay, startTime, endTime, endDate, description }) {
   if (!String(title ?? '').trim()) return 'Wpisz nazwę wydarzenia.';
+  if (String(description ?? '').length > MAX_EVENT_DESC) return `Opis może mieć maksymalnie ${MAX_EVENT_DESC} znaków.`;
   if (!parseDateKey(date)) return 'Wybierz datę wydarzenia.';
 
   if (allDay) {
@@ -319,6 +323,53 @@ export function nextPriority(current) {
   return PRIORITIES[(i + 1) % PRIORITIES.length];
 }
 
+// ------------------------------------------------- LISTY ZADAŃ I PODZADANIA --
+/** Nazwa listy zadań – walidacja formularza „Nowa lista” / „Zmień nazwę”. */
+export function validateListName(name) {
+  const trimmed = String(name ?? '').trim();
+  if (!trimmed) return 'Wpisz nazwę listy.';
+  if (trimmed.length > MAX_LIST_NAME) return `Nazwa listy może mieć maksymalnie ${MAX_LIST_NAME} znaków.`;
+  return null;
+}
+
+/**
+ * Zadania należące do danej listy. `listId` == null/undefined/'' oznacza
+ * listę domyślną – to samo umownie stosujemy w polu `listId` zadania (brak pola = domyślna).
+ */
+export function tasksInList(tasks, listId) {
+  const target = listId || null;
+  return tasks.filter((t) => (t.listId || null) === target);
+}
+
+/**
+ * Buduje drzewo zadań (maks. jeden poziom zagnieżdżenia, jak w Google Tasks) z PŁASKIEJ
+ * listy zadań NALEŻĄCYCH JUŻ DO JEDNEJ LISTY (np. wynik tasksInList). Zwraca zadania
+ * nadrzędne (posortowane przez sortTasks), każde z dopisanym polem `subtasks`
+ * (też posortowanym przez sortTasks). Podzadanie, którego rodzic zniknął (skasowany,
+ * przeniesiony do innej listy…) jest zabezpieczająco pokazywane jako zadanie główne –
+ * nigdy nie znika po cichu z widoku.
+ */
+export function buildTaskTree(tasks) {
+  const byParent = new Map();
+  const roots = [];
+  for (const t of tasks) {
+    if (t.parentId) {
+      if (!byParent.has(t.parentId)) byParent.set(t.parentId, []);
+      byParent.get(t.parentId).push(t);
+    } else {
+      roots.push(t);
+    }
+  }
+  const rootIds = new Set(roots.map((t) => t.id));
+  for (const [parentId, children] of byParent) {
+    if (!rootIds.has(parentId)) {
+      roots.push(...children);
+      byParent.delete(parentId);
+    }
+  }
+  return sortTasks(roots).map((t) => ({ ...t, subtasks: sortTasks(byParent.get(t.id) || []) }));
+}
+
 // --------------------------------------------------------------- FISZKI ------
 const FIELDS = ['subject', 'topic', 'subtopic'];
 export const CARD_FIELDS = FIELDS;
@@ -395,6 +446,27 @@ export function cardLabels(type, reversed = false) {
     return reversed ? { front: 'Język obcy', back: 'Polski' } : { front: 'Polski', back: 'Język obcy' };
   }
   return { front: 'Pytanie', back: 'Odpowiedź' };
+}
+
+// -------------------------------------------------------- UDOSTĘPNIANIE FISZEK
+/**
+ * Migawka fiszek do zapisania w `shares/{id}` – tylko treść, bez stanu nauki
+ * (status/lastReviewed) i bez createdAt: u odbiorcy to ma być komplet NOWYCH fiszek.
+ */
+export function buildShareSnapshot(cards) {
+  return cards.map((c) => ({
+    subject: c.subject, topic: c.topic, subtopic: c.subtopic, type: c.type, front: c.front, back: c.back,
+  }));
+}
+
+/** Czy paczkę o takim rozmiarze da się zapisać w jednym dokumencie Firestore (limit 1 MiB)? */
+export function validateShareSize(count) {
+  if (!count) return 'Brak fiszek do udostępnienia w tym miejscu.';
+  if (count > MAX_SHARE_CARDS) {
+    return `Można udostępnić maksymalnie ${MAX_SHARE_CARDS} fiszek naraz (limit rozmiaru pliku w bazie). `
+      + 'Przejdź do węższego działu (np. konkretnego tematu albo zagadnienia) i spróbuj tam.';
+  }
+  return null;
 }
 
 // ------------------------------------------------- IMPORT JSON Z AI ---------
