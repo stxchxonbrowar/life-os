@@ -11,6 +11,8 @@ export const DAY_START_MIN = 6 * 60;          // 06:00 – początek osi czasu
 export const DAY_END_MIN = 24 * 60 - 1;       // 23:59 – koniec osi czasu
 export const LAST_START_MIN = 23 * 60 + 45;   // najpóźniejszy start klikniętego wydarzenia
 export const MAX_IMPORT = 1000;               // maks. liczba fiszek w jednym imporcie
+export const MAX_ALLDAY_SPAN_DAYS = 60;       // maks. długość wydarzenia całodniowego (dni)
+export const WEEKDAY_LABELS_PL = ['pon', 'wt', 'śr', 'czw', 'pt', 'sob', 'niedz'];
 
 export const PRIORITIES = ['low', 'medium', 'high'];
 export const PRIORITY_LABEL = { low: 'Niski', medium: 'Średni', high: 'Wysoki' };
@@ -108,6 +110,27 @@ export function shiftDateKey(key, days) {
   return dateKey(d);
 }
 
+/**
+ * Lista kluczy dat od startKey do endKey włącznie (np. ["2026-09-12","2026-09-13"]).
+ * Zwraca null, jeśli któraś z dat jest niepoprawna albo endKey < startKey.
+ * Używane do zapisu pola `days` wydarzenia całodniowego (szybkie wyszukiwanie
+ * „co się dzieje dzisiaj” przez array-contains, bez indeksu złożonego).
+ */
+export function expandDays(startKey, endKey) {
+  const start = parseDateKey(startKey);
+  const end = parseDateKey(endKey || startKey);
+  if (!start || !end || end < start) return null;
+  const days = [];
+  const cur = new Date(start);
+  let guard = 0;
+  while (cur <= end && guard < 3660) { // zabezpieczenie: maks. ~10 lat, na wszelki wypadek
+    days.push(dateKey(cur));
+    cur.setDate(cur.getDate() + 1);
+    guard += 1;
+  }
+  return days;
+}
+
 export function formatDateLong(key) {
   const d = parseDateKey(key);
   if (!d) return '';
@@ -123,6 +146,59 @@ export function nowMinutes(d = new Date()) {
   return d.getHours() * 60 + d.getMinutes() + d.getSeconds() / 60;
 }
 
+// -------------------------------------------------------- WIDOK MIESIĄCA -----
+export function monthKey(d = new Date()) {
+  return `${d.getFullYear()}-${pad2(d.getMonth() + 1)}`;
+}
+
+/** "2026-09" + delta miesięcy → "2026-10" / "2026-08" itd. (przechodzi przez granice roku). */
+export function shiftMonthKey(key, delta) {
+  const m = /^(\d{4})-(\d{2})$/.exec(key || '');
+  if (!m) return monthKey();
+  const d = new Date(Number(m[1]), Number(m[2]) - 1 + delta, 1, 12, 0, 0);
+  return monthKey(d);
+}
+
+/** "2026-09" → "Wrzesień 2026" */
+export function monthLabel(key) {
+  const m = /^(\d{4})-(\d{2})$/.exec(key || '');
+  if (!m) return '';
+  const d = new Date(Number(m[1]), Number(m[2]) - 1, 1, 12, 0, 0);
+  return capitalize(new Intl.DateTimeFormat('pl-PL', { month: 'long', year: 'numeric' }).format(d));
+}
+
+/**
+ * Siatka kalendarza dla miesiąca "RRRR-MM": tablica tygodni (poniedziałek–niedziela),
+ * każdy tydzień to 7 obiektów { key, day, inMonth, isToday }. Dni z sąsiednich
+ * miesięcy (dopełnienie do pełnych tygodni) mają inMonth: false.
+ */
+export function monthGrid(key) {
+  const m = /^(\d{4})-(\d{2})$/.exec(key || '');
+  if (!m) return [];
+  const year = Number(m[1]);
+  const month = Number(m[2]) - 1;
+  const first = new Date(year, month, 1, 12, 0, 0);
+  const last = new Date(year, month + 1, 0, 12, 0, 0);
+  const mondayIndex = (d) => (d.getDay() + 6) % 7; // pon=0 … niedz=6 (JS: niedz=0 … sob=6)
+
+  const start = new Date(first);
+  start.setDate(start.getDate() - mondayIndex(first));
+  const end = new Date(last);
+  end.setDate(end.getDate() + (6 - mondayIndex(last)));
+
+  const todayKey = dateKey();
+  const weeks = [];
+  let week = [];
+  const cur = new Date(start);
+  while (cur <= end) {
+    const k = dateKey(cur);
+    week.push({ key: k, day: cur.getDate(), inMonth: cur.getMonth() === month, isToday: k === todayKey });
+    if (week.length === 7) { weeks.push(week); week = []; }
+    cur.setDate(cur.getDate() + 1);
+  }
+  return weeks;
+}
+
 // ------------------------------------------------------------ OŚ CZASU -------
 export const minutesToPx = (min, hourPx) => ((min - DAY_START_MIN) * hourPx) / 60;
 
@@ -133,10 +209,26 @@ export function pxToMinutes(px, hourPx, snap = 15) {
   return Math.max(DAY_START_MIN, Math.min(snapped, LAST_START_MIN));
 }
 
-/** Walidacja formularza wydarzenia. Zwraca komunikat błędu albo null. */
-export function validateEvent({ title, date, startTime, endTime }) {
+/**
+ * Walidacja formularza wydarzenia — godzinowego albo całodniowego (allDay: true).
+ * Zwraca komunikat błędu albo null.
+ */
+export function validateEvent({ title, date, allDay, startTime, endTime, endDate }) {
   if (!String(title ?? '').trim()) return 'Wpisz nazwę wydarzenia.';
   if (!parseDateKey(date)) return 'Wybierz datę wydarzenia.';
+
+  if (allDay) {
+    const end = endDate || date;
+    if (!parseDateKey(end)) return 'Wybierz datę zakończenia.';
+    if (end < date) return 'Data zakończenia nie może być wcześniejsza niż data rozpoczęcia.';
+    const span = expandDays(date, end);
+    if (!span) return 'Nieprawidłowy zakres dat.';
+    if (span.length > MAX_ALLDAY_SPAN_DAYS) {
+      return `Wydarzenie całodniowe może trwać maksymalnie ${MAX_ALLDAY_SPAN_DAYS} dni – skróć zakres.`;
+    }
+    return null;
+  }
+
   const start = toMinutes(startTime);
   const end = toMinutes(endTime);
   if (Number.isNaN(start)) return 'Podaj godzinę rozpoczęcia.';
@@ -144,6 +236,32 @@ export function validateEvent({ title, date, startTime, endTime }) {
   if (start < DAY_START_MIN) return 'Planer zaczyna się o 06:00. Wybierz późniejszą godzinę rozpoczęcia.';
   if (end <= start) return 'Koniec musi być później niż początek.';
   return null;
+}
+
+/** Czy wydarzenie (godzinowe albo całodniowe) obejmuje dany dzień ("RRRR-MM-DD")? */
+export function eventTouchesDay(ev, key) {
+  if (!ev) return false;
+  if (ev.allDay) {
+    if (Array.isArray(ev.days)) return ev.days.includes(key);
+    return key >= ev.date && key <= (ev.endDate || ev.date);
+  }
+  return ev.date === key;
+}
+
+/** Krótki, czytelny zakres dat np. do banera wydarzenia całodniowego. */
+export function formatDateRangeShort(startKey, endKey) {
+  const start = parseDateKey(startKey);
+  const end = parseDateKey(endKey || startKey);
+  if (!start) return '';
+  if (!end || dateKey(start) === dateKey(end)) return formatDateShort(startKey);
+  const sameMonth = start.getFullYear() === end.getFullYear() && start.getMonth() === end.getMonth();
+  if (sameMonth) {
+    const monthLbl = new Intl.DateTimeFormat('pl-PL', { month: 'long' }).format(end);
+    return `${start.getDate()}–${end.getDate()} ${monthLbl}`;
+  }
+  const startLbl = new Intl.DateTimeFormat('pl-PL', { day: 'numeric', month: 'short' }).format(start);
+  const endLbl = new Intl.DateTimeFormat('pl-PL', { day: 'numeric', month: 'short' }).format(end);
+  return `${startLbl} – ${endLbl}`;
 }
 
 /**

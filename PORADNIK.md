@@ -82,26 +82,50 @@ service cloud.firestore {
 
     function validTask(d) {
       return d.keys().hasAll(['title', 'completed', 'priority'])
-        && d.keys().size() <= 8
+        // hasOnly (nie tylko limit liczby pól!) - żadne inne pole nie może się
+        // "podszyć" pod dozwolone, zajmując miejsce np. createdAt.
+        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt'])
         && text(d.title, 300)
         && d.completed is bool
         && d.priority in ['low', 'medium', 'high']
         && optionalTimestamp(d, 'createdAt');
     }
 
+    // Wydarzenie jest ALBO godzinowe (startTime/endTime, brak allDay/endDate/days),
+    // ALBO całodniowe (allDay == true, endDate/days, brak startTime/endTime).
+    // Wymuszamy to ściśle, żeby po przełączeniu trybu w aplikacji (setDoc, nie update)
+    // w bazie nigdy nie zostały pola ze „starego” kształtu.
     function validEvent(d) {
-      return d.keys().hasAll(['title', 'date', 'startTime', 'endTime', 'colorCode'])
-        && d.keys().size() <= 10
+      return d.keys().hasAll(['title', 'date', 'colorCode'])
+        // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
+        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days'])
         && text(d.title, 200)
         && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
-        && d.startTime is string && d.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        && d.endTime is string && d.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$');
+        && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$')
+        && (
+          (
+            (!('allDay' in d) || d.allDay == false)
+            && !('endDate' in d) && !('days' in d)
+            && d.keys().hasAll(['startTime', 'endTime'])
+            && d.startTime is string && d.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+            && d.endTime is string && d.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+          )
+          ||
+          (
+            d.allDay == true
+            && !('startTime' in d) && !('endTime' in d)
+            && d.keys().hasAll(['endDate', 'days'])
+            && d.endDate is string && d.endDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            && d.endDate >= d.date
+            && d.days is list && d.days.size() >= 1 && d.days.size() <= 60
+          )
+        );
     }
 
     function validCard(d) {
       return d.keys().hasAll(['subject', 'topic', 'subtopic', 'type', 'front', 'back', 'status'])
-        && d.keys().size() <= 12
+        // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
+        && d.keys().hasOnly(['subject', 'topic', 'subtopic', 'type', 'front', 'back', 'status', 'lastReviewed', 'createdAt'])
         && text(d.subject, 120) && text(d.topic, 120) && text(d.subtopic, 120)
         && d.type in ['standard', 'language']
         && text(d.front, 4000) && text(d.back, 4000)
@@ -128,7 +152,9 @@ service cloud.firestore {
 
 Co te reguły robią:
 - Zalogowany użytkownik widzi i zmienia wyłącznie swoje dane (`users/{jego-id}/...`). Niezalogowani i inni użytkownicy nie mają dostępu do niczego.
-- Baza odrzuca dane w złym formacie (zły priorytet, godzina 25:00, pusty tytuł, za długi tekst).
+- Baza odrzuca dane w złym formacie (zły priorytet, godzina 25:00, pusty tytuł, za długi tekst, wydarzenie całodniowe dłuższe niż 60 dni).
+- Wydarzenie musi być *albo* godzinowe, *albo* całodniowe — nigdy oba naraz i nigdy żadne z nich niepełne.
+- `hasOnly` pilnuje, żeby dokument nie miał żadnych dodatkowych, niespodziewanych pól — nie tylko ich liczby, ale i nazw.
 - Wszystko poza trzema kolekcjami (zadania, wydarzenia, fiszki) jest zamknięte.
 
 ## Krok 6: Konfiguracja aplikacji
@@ -166,7 +192,7 @@ Loguj się tym samym kontem na każdym urządzeniu. Dane synchronizują się na 
 
 ## Krok 9: Codzienne użycie
 
-**Planer.** Dotknij osi czasu w miejscu godziny albo kliknij „Dodaj”. Dotknięcie wydarzenia otwiera edycję i usuwanie. Strzałki i data na dole zmieniają dzień. Czerwona linia to bieżąca godzina.
+**Planer.** Dotknij osi czasu w miejscu godziny albo kliknij „Dodaj”. Dotknięcie wydarzenia otwiera edycję i usuwanie. Strzałki i data na dole zmieniają dzień. Czerwona linia to bieżąca godzina. Przełącznik „Dzień / Miesiąc” u góry pokazuje całą siatkę kalendarza — kropki przy numerze dnia to liczba wydarzeń, dotknięcie dnia otwiera go w widoku dnia. W formularzu wydarzenia przełącznik „Godzinowe / Całodniowe” pozwala dodać wydarzenie trwające kilka dni (np. rejs) — pokazuje się wtedy jako osobny pasek nad osią czasu w widoku dnia, na każdym dniu, który obejmuje.
 
 **Zadania.** Pole na dole ekranu. Kolorowa etykieta obok pola ustawia priorytet nowego zadania, a dotknięcie etykiety przy zadaniu zmienia jego priorytet. Usuwanie ma przycisk „Cofnij”.
 
@@ -248,10 +274,16 @@ FORMAT ODPOWIEDZI:
 - 32 testy logiki (daty i zmiana czasu, układ osi czasu, parser importu).
 - Test dostępności axe (WCAG 2.1 A i AA): brak naruszeń w jasnym i ciemnym motywie na wszystkich widokach.
 
+**Aktualizacja — widok miesiąca i wydarzenia wielodniowe:**
+- 41 testów logiki (poprzednie + nowe: zakres dat, siatka kalendarza, dopasowanie dnia do wydarzenia, walidacja obu kształtów wydarzenia).
+- 37 testów reguł bezpieczeństwa (poprzednie 19, przeliczone pod nowy kształt danych, + 18 nowych dla wydarzeń całodniowych/wielodniowych). Przy tej okazji reguły zostały dokręcone: limit liczby pól sam w sobie pozwalał podstawić 1–2 nieznane pola w miejsce opcjonalnych — teraz reguły sprawdzają dokładny zestaw dozwolonych nazw pól (`hasOnly`), nie tylko ich liczbę.
+- 27 nowych scenariuszy end-to-end dla widoku miesiąca i wydarzeń wielodniowych: przełączanie dzień/miesiąc, nawigacja między miesiącami i powrót do bieżącego, dodanie wydarzenia całodniowego rozciągniętego na kilka dni, widoczność jako kropka na każdym objętym dniu siatki, przejście z siatki do widoku dnia, edycja z zamianą godzinowe ⇄ całodniowe (i odwrotnie) bez pozostawiania „starych” pól w bazie, usunięcie. Test dostępności axe powtórzony dla nowego widoku i formularza z przełącznikiem — przy okazji wykryto i poprawiono jeden realny błąd kontrastu (przygaszone dni spoza miesiąca w siatce), zanim trafił na Twój telefon.
+
 **Niesprawdzone:**
 - Prawdziwy projekt Firebase. Testy szły na emulatorze. Pierwsze logowanie na Twoim projekcie to pierwszy test z prawdziwą chmurą.
 - iPhone i Safari, Firefox.
 - Prawdziwy GitHub Pages i wysyłka e-maila z resetem hasła.
 - Czytnik ekranu (sprawdziłem tylko automatem i klawiaturą).
+- Wydarzenie całodniowe trwające dokładnie na granicy 60 dni na żywym, nie-emulowanym Firestore (logika jest przetestowana, ale nie na prawdziwej bazie).
 
-**Ograniczenia:** brak powiadomień push. Styl Tailwind ładuje się z internetu (wymóg specyfikacji), więc pierwsze uruchomienie wymaga sieci. Kolor paska stanu na iPhonie nie zmienia się razem z motywem.
+**Ograniczenia:** brak powiadomień push. Styl Tailwind ładuje się z internetu (wymóg specyfikacji), więc pierwsze uruchomienie wymaga sieci. Kolor paska stanu na iPhonie nie zmienia się razem z motywem. Widok miesiąca dociąga dane maksymalnie 60 dni wstecz od pierwszego dnia siatki (żeby złapać wydarzenia wielodniowe zaczęte wcześniej) — to więcej odczytów niż w widoku dnia, ale wciąż daleko poniżej darmowego limitu przy normalnym użyciu.

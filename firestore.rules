@@ -16,26 +16,50 @@ service cloud.firestore {
 
     function validTask(d) {
       return d.keys().hasAll(['title', 'completed', 'priority'])
-        && d.keys().size() <= 8
+        // hasOnly (nie tylko limit liczby pól!) - żadne inne pole nie może się
+        // "podszyć" pod dozwolone, zajmując miejsce np. createdAt.
+        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt'])
         && text(d.title, 300)
         && d.completed is bool
         && d.priority in ['low', 'medium', 'high']
         && optionalTimestamp(d, 'createdAt');
     }
 
+    // Wydarzenie jest ALBO godzinowe (startTime/endTime, brak allDay/endDate/days),
+    // ALBO całodniowe (allDay == true, endDate/days, brak startTime/endTime).
+    // Wymuszamy to ściśle, żeby po przełączeniu trybu w aplikacji (setDoc, nie update)
+    // w bazie nigdy nie zostały pola ze „starego” kształtu.
     function validEvent(d) {
-      return d.keys().hasAll(['title', 'date', 'startTime', 'endTime', 'colorCode'])
-        && d.keys().size() <= 10
+      return d.keys().hasAll(['title', 'date', 'colorCode'])
+        // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
+        && d.keys().hasOnly(['title', 'date', 'colorCode', 'allDay', 'startTime', 'endTime', 'endDate', 'days'])
         && text(d.title, 200)
         && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
-        && d.startTime is string && d.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        && d.endTime is string && d.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
-        && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$');
+        && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$')
+        && (
+          (
+            (!('allDay' in d) || d.allDay == false)
+            && !('endDate' in d) && !('days' in d)
+            && d.keys().hasAll(['startTime', 'endTime'])
+            && d.startTime is string && d.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+            && d.endTime is string && d.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+          )
+          ||
+          (
+            d.allDay == true
+            && !('startTime' in d) && !('endTime' in d)
+            && d.keys().hasAll(['endDate', 'days'])
+            && d.endDate is string && d.endDate.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+            && d.endDate >= d.date
+            && d.days is list && d.days.size() >= 1 && d.days.size() <= 60
+          )
+        );
     }
 
     function validCard(d) {
       return d.keys().hasAll(['subject', 'topic', 'subtopic', 'type', 'front', 'back', 'status'])
-        && d.keys().size() <= 12
+        // hasOnly: dozwolony jest wyłącznie ten zestaw pól - żadnych podstawionych dodatkowych kluczy.
+        && d.keys().hasOnly(['subject', 'topic', 'subtopic', 'type', 'front', 'back', 'status', 'lastReviewed', 'createdAt'])
         && text(d.subject, 120) && text(d.topic, 120) && text(d.subtopic, 120)
         && d.type in ['standard', 'language']
         && text(d.front, 4000) && text(d.back, 4000)

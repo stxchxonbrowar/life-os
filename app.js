@@ -66,8 +66,10 @@ const WORDS = {
 };
 
 const state = {
-  user: null, tasks: [], cards: [], events: [],
+  user: null, tasks: [], cards: [], events: [], monthEvents: [],
   date: L.dateKey(),
+  plannerMode: 'day', // 'day' | 'month'
+  month: L.monthKey(),
   path: { subject: null, topic: null, subtopic: null },
   route: null, online: navigator.onLine, syncShown: '',
   pending: { tasks: false, cards: false, events: false },
@@ -109,7 +111,11 @@ function mapDoc(d) {
 const toRaw = ({ id, createdAtMs, lastReviewedMs, ...raw }) => raw;
 
 let unsubs = [];
-let unsubEvents = null;
+let unsubEventsDate = null; // wydarzenia godzinowe / rozpoczynające się tego dnia (where date == …)
+let unsubEventsDays = null; // wydarzenia całodniowe obejmujące ten dzień (where days array-contains …)
+let unsubMonth = null;      // widok miesiąca: jedno zapytanie zakresowe po polu date
+let dayDocsA = new Map();
+let dayDocsB = new Map();
 const shownErrors = new Set();
 
 function listenError(name, err) {
@@ -130,26 +136,82 @@ function startData() {
     scheduleRender();
   }, (err) => listenError(name, err));
   unsubs = [watch('tasks', 'tasks'), watch('flashcards', 'cards')];
-  listenEvents();
+  listenPlanner();
 }
 
-/** Wydarzenia pobieramy tylko dla wybranego dnia (mniej odczytów z darmowego limitu). */
+/** Zatrzymuje wszystkie nasłuchy wydarzeń (dnia i miesiąca) przed uruchomieniem innych. */
+function stopEventListeners() {
+  if (unsubEventsDate) unsubEventsDate();
+  if (unsubEventsDays) unsubEventsDays();
+  if (unsubMonth) unsubMonth();
+  unsubEventsDate = unsubEventsDays = unsubMonth = null;
+}
+
+/**
+ * Wydarzenia widoczne w widoku DNIA — dwa niezależne zapytania, każde na jednym polu
+ * (żadne nie wymaga indeksu złożonego):
+ *  A) date == wybrany dzień           → wydarzenia godzinowe + całodniowe zaczynające się dziś
+ *  B) days array-contains wybrany dzień → wydarzenia całodniowe/wielodniowe obejmujące ten dzień
+ * Wynik jest sumą (po id), bo część wydarzeń całodniowych spełnia oba warunki naraz.
+ */
 function listenEvents() {
-  if (unsubEvents) unsubEvents();
+  stopEventListeners();
+  dayDocsA = new Map();
+  dayDocsB = new Map();
   state.events = [];
-  unsubEvents = onSnapshot(query(colRef('planner_events'), where('date', '==', state.date)), (snap) => {
-    state.events = snap.docs.map(mapDoc);
-    state.pending.events = snap.metadata.hasPendingWrites;
+  const mergeAndRender = () => {
+    const merged = new Map(dayDocsA);
+    for (const [id, ev] of dayDocsB) merged.set(id, ev);
+    state.events = [...merged.values()];
     scheduleRender();
+  };
+  unsubEventsDate = onSnapshot(query(colRef('planner_events'), where('date', '==', state.date)), (snap) => {
+    dayDocsA = new Map(snap.docs.map((d) => [d.id, mapDoc(d)]));
+    state.pending.events = snap.metadata.hasPendingWrites;
+    mergeAndRender();
   }, (err) => listenError('planner_events', err));
+  unsubEventsDays = onSnapshot(query(colRef('planner_events'), where('days', 'array-contains', state.date)), (snap) => {
+    dayDocsB = new Map(snap.docs.map((d) => [d.id, mapDoc(d)]));
+    mergeAndRender();
+  }, (err) => listenError('planner_events', err));
+}
+
+/**
+ * Wydarzenia widoczne w widoku MIESIĄCA — jedno zapytanie zakresowe, oba warunki na TYM SAMYM
+ * polu (date), więc też bez indeksu złożonego: date >= (początek siatki – MAX_ALLDAY_SPAN_DAYS)
+ * AND date <= koniec siatki. Cofnięcie o MAX_ALLDAY_SPAN_DAYS gwarantuje, że złapiemy też
+ * wydarzenia wielodniowe, które zaczęły się przed tym miesiącem, a wciąż do niego wchodzą.
+ * Właściwe „czy ten dzień jest objęty” liczymy już po stronie klienta (L.eventTouchesDay).
+ */
+function listenMonth() {
+  stopEventListeners();
+  state.monthEvents = [];
+  const grid = L.monthGrid(state.month);
+  if (!grid.length) return;
+  const gridStart = grid[0][0].key;
+  const gridEnd = grid[grid.length - 1][6].key;
+  const lookback = L.shiftDateKey(gridStart, -L.MAX_ALLDAY_SPAN_DAYS);
+  unsubMonth = onSnapshot(
+    query(colRef('planner_events'), where('date', '>=', lookback), where('date', '<=', gridEnd)),
+    (snap) => {
+      state.monthEvents = snap.docs.map(mapDoc);
+      state.pending.events = snap.metadata.hasPendingWrites;
+      scheduleRender();
+    },
+    (err) => listenError('planner_events', err),
+  );
+}
+
+/** Uruchamia właściwy nasłuch wydarzeń zależnie od aktywnego trybu planera. */
+function listenPlanner() {
+  if (state.plannerMode === 'month') listenMonth(); else listenEvents();
 }
 
 function stopData() {
   unsubs.forEach((u) => u());
   unsubs = [];
-  if (unsubEvents) unsubEvents();
-  unsubEvents = null;
-  Object.assign(state, { tasks: [], cards: [], events: [] });
+  stopEventListeners();
+  Object.assign(state, { tasks: [], cards: [], events: [], monthEvents: [] });
 }
 
 function dbError(err) {
@@ -272,15 +334,23 @@ const PlannerView = {
     }
     hours += `<div class="tl-line" style="top:${18 * HOUR_PX}px"></div>`;
     $('#view').innerHTML = `<div class="page">
-        <h1 class="page-title" id="pl-title"></h1>
+        <div class="pl-headrow">
+          <h1 class="page-title" id="pl-title"></h1>
+          <div class="seg" role="group" aria-label="Widok planera">
+            <button type="button" class="seg-btn" data-act="pl-mode-day" id="pl-tab-day" aria-pressed="true">Dzień</button>
+            <button type="button" class="seg-btn" data-act="pl-mode-month" id="pl-tab-month" aria-pressed="false">Miesiąc</button>
+          </div>
+        </div>
         <div class="page-sub" id="pl-sub"></div>
-        <div class="tl"><div class="tl-body" id="tl-body">${hours}<div id="tl-events"></div><div id="tl-now"></div></div></div>
+        <div id="pl-allday"></div>
+        <div class="tl" id="pl-dayview"><div class="tl-body" id="tl-body">${hours}<div id="tl-events"></div><div id="tl-now"></div></div></div>
+        <div id="pl-monthview" class="hide"></div>
       </div>`;
     $('#dock').innerHTML = `<div class="dock-pill glass">
-        <button type="button" class="icon-btn" data-act="pl-prev" aria-label="Poprzedni dzień">${icon('chevron-left')}</button>
+        <button type="button" class="icon-btn" data-act="pl-prev" id="pl-prevbtn" aria-label="Poprzedni dzień">${icon('chevron-left')}</button>
         <button type="button" class="btn btn-plain" style="flex:1;min-width:0" data-act="pl-pick" id="pl-datebtn" aria-label="Wybierz datę"></button>
         <input type="date" id="pl-date" class="sr-only" tabindex="-1" aria-hidden="true">
-        <button type="button" class="icon-btn" data-act="pl-next" aria-label="Następny dzień">${icon('chevron-right')}</button>
+        <button type="button" class="icon-btn" data-act="pl-next" id="pl-nextbtn" aria-label="Następny dzień">${icon('chevron-right')}</button>
         <button type="button" class="btn btn-primary" data-act="pl-add">${icon('plus')} Dodaj</button>
       </div>`;
     // Kliknięcie w oś czasu = nowe wydarzenie o godzinie, w którą kliknięto (co 15 minut). Kliknięcie w blok = edycja.
@@ -322,16 +392,39 @@ const PlannerView = {
   },
 
   update() {
+    const isMonth = state.plannerMode === 'month';
+    $('#pl-tab-day').setAttribute('aria-pressed', String(!isMonth));
+    $('#pl-tab-month').setAttribute('aria-pressed', String(isMonth));
+    $('#pl-dayview').classList.toggle('hide', isMonth);
+    $('#pl-monthview').classList.toggle('hide', !isMonth);
+    $('#pl-allday').classList.toggle('hide', isMonth);
+    $('#pl-prevbtn').setAttribute('aria-label', isMonth ? 'Poprzedni miesiąc' : 'Poprzedni dzień');
+    $('#pl-nextbtn').setAttribute('aria-label', isMonth ? 'Następny miesiąc' : 'Następny dzień');
+    if (isMonth) this.updateMonth(); else this.updateDay();
+  },
+
+  updateDay() {
     const today = L.dateKey();
     const rel = state.date === L.shiftDateKey(today, 1) ? 'Jutro' : state.date === L.shiftDateKey(today, -1) ? 'Wczoraj' : '';
     $('#pl-title').textContent = state.date === today ? 'Dziś' : L.formatDateLong(state.date);
+    const timed = state.events.filter((ev) => !ev.allDay);
+    const allDay = state.events.filter((ev) => ev.allDay)
+      .sort((a, b) => a.date.localeCompare(b.date) || a.title.localeCompare(b.title, 'pl'));
     const n = state.events.length;
     const count = n ? L.plural(n, WORDS.event) : 'Brak wydarzeń. Dotknij osi czasu, żeby dodać.';
     $('#pl-sub').innerHTML = `<p>${esc(state.date === today ? L.formatDateLong(state.date) : rel)}</p><p>${esc(count)}</p>`
       + (state.date !== today ? '<button type="button" class="btn btn-tonal" style="margin-top:.6rem" data-act="pl-today">Wróć do dziś</button>' : '');
     $('#pl-datebtn').textContent = state.date === today ? 'Dziś' : L.formatDateShort(state.date);
 
-    const blocks = L.layoutEvents(state.events).map((ev) => {
+    $('#pl-allday').innerHTML = allDay.map((ev) => {
+      const color = L.safeColor(ev.colorCode);
+      const span = ev.date === ev.endDate ? '' : L.formatDateRangeShort(ev.date, ev.endDate);
+      return `<button type="button" class="allday-chip" data-act="pl-allday-edit" data-id="${esc(ev.id)}"
+        style="border-left-color:${color};background-color:${color}22" aria-label="Całodniowe: ${esc(ev.title)}${span ? `, ${esc(span)}` : ''}">
+        <span class="allday-title">${esc(ev.title)}</span>${span ? `<span class="allday-range">${esc(span)}</span>` : ''}</button>`;
+    }).join('');
+
+    const blocks = L.layoutEvents(timed).map((ev) => {
       const color = L.safeColor(ev.colorCode);
       const top = L.minutesToPx(ev.startMin, HOUR_PX);
       const height = Math.max(((ev.endMin - ev.startMin) * HOUR_PX) / 60, 26);
@@ -347,13 +440,60 @@ const PlannerView = {
     this.drawNow();
     if (state.scrollPlanner) { state.scrollPlanner = false; this.scrollToRelevant(); }
   },
+
+  updateMonth() {
+    $('#pl-title').textContent = L.monthLabel(state.month);
+    $('#pl-datebtn').textContent = L.monthLabel(state.month);
+    const today = L.dateKey();
+    const isCurrentMonth = state.month === L.monthKey();
+    $('#pl-sub').innerHTML = isCurrentMonth ? '' : '<button type="button" class="btn btn-tonal" data-act="pl-month-today">Wróć do bieżącego miesiąca</button>';
+    const weeks = L.monthGrid(state.month);
+    const head = L.WEEKDAY_LABELS_PL.map((w) => `<div class="mg-head">${esc(w)}</div>`).join('');
+    const body = weeks.map((week) => week.map((cell) => {
+      const dayEvents = state.monthEvents.filter((ev) => L.eventTouchesDay(ev, cell.key));
+      const dots = dayEvents.slice(0, 3).map((ev) => `<span class="mg-dot" style="background:${L.safeColor(ev.colorCode)}"></span>`).join('');
+      const more = dayEvents.length > 3 ? `<span class="mg-more">+${dayEvents.length - 3}</span>` : '';
+      const label = `${L.formatDateLong(cell.key)}${dayEvents.length ? `, ${L.plural(dayEvents.length, WORDS.event)}` : ''}`;
+      return `<button type="button" class="mg-day${cell.inMonth ? '' : ' mg-out'}${cell.key === today ? ' mg-today' : ''}${cell.key === state.date ? ' mg-selected' : ''}"
+        data-act="pl-goto-day" data-key="${cell.key}" aria-label="${esc(label)}">
+        <span class="mg-num">${cell.day}</span>
+        ${dayEvents.length ? `<span class="mg-dots">${dots}${more}</span>` : ''}</button>`;
+    }).join('')).join('');
+    $('#pl-monthview').innerHTML = `<div class="mg-head-row">${head}</div><div class="mg-grid">${body}</div>`;
+  },
 };
 
+/** Przełącza na widok dnia dla wskazanej daty (z widoku miesiąca też). */
 function setDate(key) {
-  if (!key || key === state.date) return;
+  if (!key) return;
+  const switchingFromMonth = state.plannerMode !== 'day';
+  if (key === state.date && !switchingFromMonth) return;
   state.date = key;
+  state.plannerMode = 'day';
   state.scrollPlanner = true;
   listenEvents();
+  scheduleRender();
+}
+
+/** Przechodzi do innego miesiąca w widoku miesiąca (nawigacja strzałkami). */
+function setMonth(key) {
+  if (!key || key === state.month) return;
+  state.month = key;
+  listenMonth();
+  scheduleRender();
+}
+
+/** Przełącza tryb planera (dzień ⇄ miesiąc) i uruchamia właściwy nasłuch danych. */
+function setPlannerMode(mode) {
+  if (mode === state.plannerMode) return;
+  state.plannerMode = mode;
+  if (mode === 'month') {
+    state.month = L.monthKey(L.parseDateKey(state.date) || new Date());
+    listenMonth();
+  } else {
+    state.scrollPlanner = true;
+    listenEvents();
+  }
   scheduleRender();
 }
 
@@ -369,14 +509,31 @@ function defaultStart() {
   return L.toHHMM(Math.max(L.DAY_START_MIN, Math.min(next, L.LAST_START_MIN)));
 }
 
-/** Formularz wydarzenia (nowe albo edycja). */
-function openEventSheet({ id, startTime, endTime } = {}) {
+/** Pokazuje/ukrywa pola godzinowe vs. całodniowe w formularzu wydarzenia i pilnuje sensownej daty końca. */
+function toggleEventAllDayFields(form) {
+  const allDay = form.allDay.value === '1';
+  $('#ev-timed-fields', form).style.display = allDay ? 'none' : 'grid';
+  $('#ev-allday-fields', form).style.display = allDay ? 'block' : 'none';
+  $('label[for="ev-date"]', form).textContent = allDay ? 'Data rozpoczęcia' : 'Data';
+  if (allDay && (!form.endDate.value || form.endDate.value < form.date.value)) form.endDate.value = form.date.value;
+}
+
+/** Formularz wydarzenia (nowe albo edycja) – godzinowe albo całodniowe/wielodniowe. */
+function openEventSheet({ id, startTime, endTime, date } = {}) {
   const ev = id ? state.events.find((e) => e.id === id) : null;
   if (id && !ev) return;
-  const start = ev ? ev.startTime : (startTime || defaultStart());
+  const allDay = ev ? !!ev.allDay : false;
+  const start = ev ? (ev.startTime || defaultStart()) : (startTime || defaultStart());
   const v = ev
-    ? { title: ev.title, date: ev.date, start: ev.startTime, end: ev.endTime, color: L.safeColor(ev.colorCode) }
-    : { title: '', date: state.date, start, end: endTime || L.toHHMM(Math.min(L.toMinutes(start) + 60, 23 * 60 + 59)), color: L.DEFAULT_EVENT_COLOR };
+    ? {
+      title: ev.title, date: ev.date, start: ev.startTime || start,
+      end: ev.endTime || L.toHHMM(Math.min(L.toMinutes(start) + 60, 23 * 60 + 59)),
+      endDate: ev.endDate || ev.date, color: L.safeColor(ev.colorCode),
+    }
+    : {
+      title: '', date: date || state.date, start, end: endTime || L.toHHMM(Math.min(L.toMinutes(start) + 60, 23 * 60 + 59)),
+      endDate: date || state.date, color: L.DEFAULT_EVENT_COLOR,
+    };
   const swatches = L.EVENT_COLORS.map((c) => `<label class="swatch" title="${c.name}">
       <input type="radio" name="color" value="${c.hex}" class="sr-only" aria-label="${c.name}" ${c.hex.toLowerCase() === v.color.toLowerCase() ? 'checked' : ''}>
       <span class="swatch-dot" style="background:${c.hex}">${icon('check')}</span></label>`).join('');
@@ -385,11 +542,26 @@ function openEventSheet({ id, startTime, endTime } = {}) {
     body: `<form data-form="event" data-id="${esc(id || '')}" style="display:flex;flex-direction:column;gap:.9rem" novalidate>
       <div><label class="label" for="ev-title">Nazwa</label>
         <input id="ev-title" name="title" class="field" maxlength="120" value="${esc(v.title)}" ${ev ? '' : 'autofocus'} autocomplete="off"></div>
-      <div><label class="label" for="ev-date">Data</label><input id="ev-date" name="date" type="date" class="field" value="${esc(v.date)}"></div>
-      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+
+      <fieldset class="seg-field"><legend class="sr-only">Rodzaj wydarzenia</legend>
+        <div class="seg">
+          <label class="seg-opt"><input type="radio" name="allDay" value="0" class="sr-only" ${allDay ? '' : 'checked'}><span>Godzinowe</span></label>
+          <label class="seg-opt"><input type="radio" name="allDay" value="1" class="sr-only" ${allDay ? 'checked' : ''}><span>Całodniowe</span></label>
+        </div>
+      </fieldset>
+
+      <div><label class="label" for="ev-date">${allDay ? 'Data rozpoczęcia' : 'Data'}</label><input id="ev-date" name="date" type="date" class="field" value="${esc(v.date)}"></div>
+
+      <div id="ev-timed-fields" style="display:${allDay ? 'none' : 'grid'};grid-template-columns:1fr 1fr;gap:.75rem">
         <div><label class="label" for="ev-start">Początek</label><input id="ev-start" name="start" type="time" min="06:00" class="field" value="${esc(v.start)}"></div>
         <div><label class="label" for="ev-end">Koniec</label><input id="ev-end" name="end" type="time" class="field" value="${esc(v.end)}"></div>
       </div>
+
+      <div id="ev-allday-fields" style="display:${allDay ? 'block' : 'none'}">
+        <label class="label" for="ev-enddate">Data zakończenia</label>
+        <input id="ev-enddate" name="endDate" type="date" class="field" value="${esc(v.endDate)}">
+      </div>
+
       <fieldset><legend class="label">Kolor</legend><div class="swatches">${swatches}</div></fieldset>
       <p class="form-error hide" role="alert"></p>
       <div style="display:flex;gap:.5rem">
@@ -891,11 +1063,16 @@ const actions = {
     try { await sendPasswordResetEmail(auth, email); loginMessage('Jeśli konto istnieje, wysłaliśmy link do zmiany hasła. Sprawdź także spam.'); } catch (e) { loginMessage(AUTH_ERRORS[e.code] || 'Nie udało się wysłać linku.'); }
   },
   'sheet-close': () => closeSheet(),
-  'pl-prev': () => setDate(L.shiftDateKey(state.date, -1)),
-  'pl-next': () => setDate(L.shiftDateKey(state.date, 1)),
+  'pl-prev': () => (state.plannerMode === 'month' ? setMonth(L.shiftMonthKey(state.month, -1)) : setDate(L.shiftDateKey(state.date, -1))),
+  'pl-next': () => (state.plannerMode === 'month' ? setMonth(L.shiftMonthKey(state.month, 1)) : setDate(L.shiftDateKey(state.date, 1))),
   'pl-today': () => setDate(L.dateKey()),
+  'pl-month-today': () => setMonth(L.monthKey()),
   'pl-pick': () => pickDate(),
   'pl-add': () => openEventSheet(),
+  'pl-mode-day': () => setDate(state.date),
+  'pl-mode-month': () => setPlannerMode('month'),
+  'pl-goto-day': (el) => setDate(el.dataset.key),
+  'pl-allday-edit': (el) => openEventSheet({ id: el.dataset.id }),
   'ev-del': (el) => {
     const ev = state.events.find((e) => e.id === el.dataset.id);
     closeSheet();
@@ -963,17 +1140,32 @@ const forms = {
 
   event: (f) => {
     const fd = new FormData(f);
-    const data = {
-      title: String(fd.get('title') || '').trim(), date: fd.get('date'),
-      startTime: fd.get('start'), endTime: fd.get('end'),
-      colorCode: L.safeColor(fd.get('color') || L.DEFAULT_EVENT_COLOR),
-    };
-    const error = L.validateEvent(data);
-    if (error) { showFormError(f, error); return; }
+    const allDay = fd.get('allDay') === '1';
+    const title = String(fd.get('title') || '').trim();
+    const date = fd.get('date');
+    const colorCode = L.safeColor(fd.get('color') || L.DEFAULT_EVENT_COLOR);
+    let data;
+    if (allDay) {
+      const endDate = fd.get('endDate') || date;
+      const error = L.validateEvent({ title, date, allDay: true, endDate });
+      if (error) { showFormError(f, error); return; }
+      data = { title, date, allDay: true, endDate, days: L.expandDays(date, endDate), colorCode };
+    } else {
+      const startTime = fd.get('start');
+      const endTime = fd.get('end');
+      const error = L.validateEvent({ title, date, startTime, endTime });
+      if (error) { showFormError(f, error); return; }
+      data = { title, date, startTime, endTime, colorCode };
+    }
     const id = f.dataset.id;
-    (id ? updateDoc(docRef('planner_events', id), data) : addDoc(colRef('planner_events'), data)).catch(dbError);
+    // setDoc (pełne nadpisanie), NIE updateDoc: przy przełączeniu godzinowe ⇄ całodniowe w bazie
+    // nie mogą zostać pola ze „starego” kształtu – reguły Firestore są na to celowo surowe.
+    (id ? setDoc(docRef('planner_events', id), data) : addDoc(colRef('planner_events'), data)).catch(dbError);
     closeSheet();
-    if (data.date !== state.date) setDate(data.date);
+    if (state.plannerMode === 'day') {
+      const touchesToday = allDay ? L.eventTouchesDay(data, state.date) : data.date === state.date;
+      if (!touchesToday) setDate(data.date);
+    }
     toast(id ? 'Zapisano zmiany' : 'Dodano wydarzenie');
   },
 
@@ -1041,6 +1233,10 @@ function wireGlobalEvents() {
     const cb = e.target.closest('input.check-in');
     if (cb) TasksView.toggle(cb.dataset.id, cb.checked);
     if (e.target.id === 'pl-date' && e.target.value) setDate(e.target.value);
+    if (e.target.name === 'allDay') {
+      const form = e.target.closest('form[data-form="event"]');
+      if (form) toggleEventAllDayFields(form);
+    }
   });
   $('#sheet').addEventListener('click', (e) => { if (e.target === $('#sheet')) closeSheet(); });
   const dlg = $('#study');
