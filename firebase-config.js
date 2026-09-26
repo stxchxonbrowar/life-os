@@ -14,12 +14,12 @@
  * ========================================================================== */
 
 export const firebaseConfig = {
-  apiKey: "WKLEJ_TUTAJ",
-  authDomain: "WKLEJ_TUTAJ",
-  projectId: "WKLEJ_TUTAJ",
-  storageBucket: "WKLEJ_TUTAJ",
-  messagingSenderId: "WKLEJ_TUTAJ",
-  appId: "WKLEJ_TUTAJ",
+  apiKey: "AIzaSyB1LM9YbeK5nAMHv_ba0XD-Nms0Ifau5ts",
+  authDomain: "life-os-stachu.firebaseapp.com",
+  projectId: "life-os-stachu",
+  storageBucket: "life-os-stachu.firebasestorage.app",
+  messagingSenderId: "361606677856",
+  appId: "1:361606677856:web:3b0f00cc606f8c41758a05",
 };
 
 /* ▲▲▲  KONIEC EDYCJI – niżej nic nie zmieniaj  ▲▲▲ */
