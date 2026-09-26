@@ -1,0 +1,60 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+
+    // Każdy użytkownik widzi i zmienia WYŁĄCZNIE dane w swojej gałęzi users/{jego-uid}/...
+    // Niezalogowani i inni użytkownicy nie mają dostępu do niczego.
+    function isOwner(uid) {
+      return request.auth != null && request.auth.uid == uid;
+    }
+    function text(v, max) {
+      return v is string && v.size() > 0 && v.size() <= max;
+    }
+    function optionalTimestamp(d, k) {
+      return !(k in d) || d[k] == null || d[k] is timestamp;
+    }
+
+    function validTask(d) {
+      return d.keys().hasAll(['title', 'completed', 'priority'])
+        && d.keys().size() <= 8
+        && text(d.title, 300)
+        && d.completed is bool
+        && d.priority in ['low', 'medium', 'high']
+        && optionalTimestamp(d, 'createdAt');
+    }
+
+    function validEvent(d) {
+      return d.keys().hasAll(['title', 'date', 'startTime', 'endTime', 'colorCode'])
+        && d.keys().size() <= 10
+        && text(d.title, 200)
+        && d.date is string && d.date.matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$')
+        && d.startTime is string && d.startTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && d.endTime is string && d.endTime.matches('^([01][0-9]|2[0-3]):[0-5][0-9]$')
+        && d.colorCode is string && d.colorCode.matches('^#[0-9A-Fa-f]{6}$');
+    }
+
+    function validCard(d) {
+      return d.keys().hasAll(['subject', 'topic', 'subtopic', 'type', 'front', 'back', 'status'])
+        && d.keys().size() <= 12
+        && text(d.subject, 120) && text(d.topic, 120) && text(d.subtopic, 120)
+        && d.type in ['standard', 'language']
+        && text(d.front, 4000) && text(d.back, 4000)
+        && d.status in ['new', 'hard', 'good', 'easy']
+        && optionalTimestamp(d, 'lastReviewed')
+        && optionalTimestamp(d, 'createdAt');
+    }
+
+    match /users/{uid}/tasks/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid) && validTask(request.resource.data);
+    }
+    match /users/{uid}/planner_events/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid) && validEvent(request.resource.data);
+    }
+    match /users/{uid}/flashcards/{id} {
+      allow read, delete: if isOwner(uid);
+      allow create, update: if isOwner(uid) && validCard(request.resource.data);
+    }
+  }
+}
