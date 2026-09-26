@@ -216,7 +216,7 @@ Loguj się tym samym kontem na każdym urządzeniu. Dane synchronizują się na 
 | „Brak uprawnień do zapisu/odczytu” | reguły niewklejone albo nieopublikowane, albo baza ma inną nazwę niż `(default)` | krok 5 (**Publish**) i krok 3 |
 | `auth/unauthorized-domain` | domena strony nie jest na liście Firebase | krok 7, akapit o Authorized domains |
 | Biała strona albo „Nie udało się uruchomić aplikacji” | brak internetu przy pierwszym wejściu albo otwarcie z dysku | otwórz adres https i odśwież |
-| Po aktualizacji widać starą wersję | nowa wersja pobiera się w tle | zamknij i otwórz aplikację dwa razy |
+| Po aktualizacji widać starą wersję nawet po kilku otwarciach | przeglądarka trzyma starą kopię aplikacji w tzw. Service Workerze | **Komputer (Chrome/Edge):** F12, zakładka „Application” (albo „Aplikacja”), po lewej „Service Workers”, kliknij „Unregister”, potem odśwież stronę na twardo (Ctrl+Shift+R, na Macu Cmd+Shift+R). **Telefon:** w Chrome menu ⋮ → Historia → Wyczyść dane przeglądania → zaznacz tylko „Obrazy i pliki w pamięci podręcznej” → Wyczyść dane, potem otwórz aplikację ponownie. Zainstalowaną aplikację (ikona na ekranie głównym) czasem trzeba odinstalować i zainstalować od nowa. |
 | „Przekroczono dzienny limit” | dzienny limit Firestore | poczekaj do resetu (ok. 9:00 rano) |
 
 ---
