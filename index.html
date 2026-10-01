@@ -284,6 +284,14 @@
   .dark .allday-chip:hover { filter: brightness(1.2); }
   .allday-title { font-weight: 600; font-size: .875rem; overflow-wrap: anywhere; }
   .allday-range { font-size: .75rem; color: rgb(var(--muted)); }
+  /* Termin zadania w pasku całodniowym: ten sam kształt co .allday-chip, kolor od priorytetu
+     (nie od wydarzenia – zadania nie mają colorCode), tekst zawsze w kolorze motywu. */
+  .allday-chip-task { flex-direction: row; align-items: center; gap: .5rem; }
+  .allday-chip-task.pr-high { border-left-color: rgb(var(--danger)); background: rgb(var(--danger) / .12); }
+  .allday-chip-task.pr-medium { border-left-color: rgb(var(--amber)); background: rgb(var(--amber) / .14); }
+  .allday-chip-task.pr-low { border-left-color: rgb(var(--brand)); background: rgb(var(--brand) / .1); }
+  .allday-chip-task .ic { flex: none; width: 1.1rem; height: 1.1rem; }
+  .allday-chip-task.done .allday-title { text-decoration: line-through; opacity: .65; }
 
   /* ------------------------------------------------------------- PLANER: MIESIĄC */
   .mg-head-row { display: grid; grid-template-columns: repeat(7, 1fr); margin-top: 1.25rem; }
@@ -315,6 +323,11 @@
     white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
   }
   .mg-more { font-size: .6rem; font-weight: 700; color: rgb(var(--muted)); text-align: left; align-self: flex-start; padding-left: .3rem; }
+  /* Termin zadania w siatce miesiąca: ten sam wzór co .mg-chip, kolor od priorytetu zadania. */
+  .mg-chip-task.pr-high { background: rgb(var(--danger) / .14); border-left-color: rgb(var(--danger)); }
+  .mg-chip-task.pr-medium { background: rgb(var(--amber) / .16); border-left-color: rgb(var(--amber)); }
+  .mg-chip-task.pr-low { background: rgb(var(--brand) / .12); border-left-color: rgb(var(--brand)); }
+  .mg-chip-task.done { opacity: .55; text-decoration: line-through; }
 
   /* ---------------------------------------------------------------- ZADANIA */
   .check-wrap { position: relative; width: 44px; height: 44px; display: grid; place-items: center; cursor: pointer; flex: none; }
@@ -330,6 +343,18 @@
   .task-sub { margin-left: 1.75rem; width: calc(100% - 1.75rem); background: rgb(var(--fg) / .025); font-size: .92rem; }
   .task-sub .check-wrap { width: 38px; height: 38px; }
   .task-sub .check-box { width: 1.3rem; height: 1.3rem; }
+  /* Nazwa zadania jest teraz przyciskiem (dotknięcie = edycja), nie samym tekstem. */
+  .task-title-btn {
+    display: flex; flex-direction: column; align-items: flex-start; gap: 1px; flex: 1 1 auto; min-width: 0;
+    background: none; border: none; font: inherit; color: inherit; text-align: left; padding: .4rem 0; cursor: pointer;
+  }
+  .task-title-btn:focus-visible { outline: 2px solid rgb(var(--brand)); outline-offset: 2px; border-radius: .35rem; }
+  .task-deadline { display: flex; align-items: center; gap: .2rem; font-size: .78rem; color: rgb(var(--muted)); }
+  .task-deadline .ic { width: .8rem; height: .8rem; flex: none; }
+  .task-deadline.overdue { color: rgb(var(--danger-fg)); }
+  /* Krótkie podświetlenie wiersza po „skoku” z terminu w Planerze, żeby było widać, który to wiersz. */
+  @keyframes task-flash { 0%, 100% { background: transparent; } 30% { background: rgb(var(--brand) / .18); } }
+  .task-flash { animation: task-flash 1.4s ease; border-radius: 1rem; }
 
   /* ------------------------------------------------------- ARKUSZ / MODAL */
   dialog.sheet {

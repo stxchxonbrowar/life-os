@@ -15,6 +15,7 @@ export const MAX_ALLDAY_SPAN_DAYS = 60;       // maks. długość wydarzenia ca�
 export const MAX_EVENT_DESC = 2000;           // maks. długość opisu wydarzenia
 export const MAX_LIST_NAME = 60;              // maks. długość nazwy listy zadań
 export const MAX_SHARE_CARDS = 100;           // maks. liczba fiszek w jednej paczce do udostępnienia
+export const MAX_BROWSE_SHOWN = 200;          // maks. liczba fiszek pokazywanych naraz na liście do przeglądania
 export const WEEKDAY_LABELS_PL = ['pon', 'wt', 'śr', 'czw', 'pt', 'sob', 'niedz'];
 
 export const PRIORITIES = ['low', 'medium', 'high'];
@@ -311,9 +312,21 @@ export function layoutEvents(events) {
 }
 
 // -------------------------------------------------------------- ZADANIA ------
+/**
+ * Ręczna kolejność (pole `order`) decyduje TYLKO między dwoma zadaniami OTWARTYMI –
+ * ukończone i tak lądują na końcu (patrz sortTasks), więc dawna, teraz już nieaktualna
+ * wartość `order` zostawiona na ukończonym zadaniu nie ma wpływu na jego miejsce.
+ */
+function orderCompare(a, b) {
+  if (a.completed || b.completed) return 0;
+  if (!Number.isFinite(a.order) || !Number.isFinite(b.order)) return 0;
+  return a.order - b.order;
+}
+
 export function sortTasks(tasks) {
   return [...tasks].sort((a, b) =>
     (Number(!!a.completed) - Number(!!b.completed))
+    || orderCompare(a, b)
     || ((PRIORITY_RANK[a.priority] ?? 1) - (PRIORITY_RANK[b.priority] ?? 1))
     || ((b.createdAtMs ?? 0) - (a.createdAtMs ?? 0)));
 }
@@ -321,6 +334,95 @@ export function sortTasks(tasks) {
 export function nextPriority(current) {
   const i = PRIORITIES.indexOf(current);
   return PRIORITIES[(i + 1) % PRIORITIES.length];
+}
+
+/**
+ * Wartość `order` dla NOWEGO zadania dopisywanego na koniec rodzeństwa (ta sama lista
+ * i ten sam rodzic, tylko zadania OTWARTE). Zwraca null, jeśli ta grupa nigdy nie była
+ * ręcznie przestawiana – wtedy pole `order` w ogóle nie jest zapisywane (brak pola =
+ * kolejność wynika z priorytetu/daty, jak dotychczas), żeby nie wymuszać migracji.
+ */
+export function nextOrderValue(openSiblings) {
+  const nums = openSiblings.map((t) => t.order).filter((n) => Number.isFinite(n));
+  if (!nums.length) return null;
+  return Math.max(...nums) + 1;
+}
+
+/**
+ * Przygotowuje przesunięcie zadania `id` o jedno miejsce w górę (direction -1) albo w dół
+ * (direction +1) wśród OTWARTEGO rodzeństwa (`openSiblings`: ta sama lista i ten sam rodzic,
+ * tylko nieukończone). Jeśli żadne z rodzeństwa nie ma jeszcze pola `order` (nikt wcześniej
+ * nie przestawiał tej grupy), najpierw "materializuje" kolejność całej grupy na podstawie
+ * aktualnego sortowania (priorytet, potem najnowsze) – dopiero na niej wykonuje zamianę.
+ * Zwraca tablicę { id, order } do zapisania (writeBatch) dla WSZYSTKICH elementów grupy,
+ * albo null, gdy przesunięcie nie jest możliwe (zadanie na krawędzi listy albo nie znalezione).
+ */
+export function planMoveTask(openSiblings, id, direction) {
+  const current = sortTasks(openSiblings);
+  const idx = current.findIndex((t) => t.id === id);
+  if (idx === -1) return null;
+  const swapIdx = idx + direction;
+  if (swapIdx < 0 || swapIdx >= current.length) return null;
+  const hasOrder = current.every((t) => Number.isFinite(t.order));
+  const result = hasOrder
+    ? current.map((t) => ({ id: t.id, order: t.order }))
+    : current.map((t, i) => ({ id: t.id, order: i }));
+  const tmp = result[idx].order;
+  result[idx].order = result[swapIdx].order;
+  result[swapIdx].order = tmp;
+  return result;
+}
+
+/** Walidacja opcjonalnego terminu zadania (data, opcjonalnie godzina – ale tylko razem z datą). */
+export function validateDeadline({ deadlineDate, deadlineTime } = {}) {
+  const date = String(deadlineDate ?? '').trim();
+  const time = String(deadlineTime ?? '').trim();
+  if (!date && !time) return null;
+  if (!date) return 'Wybierz datę terminu albo usuń godzinę.';
+  if (!parseDateKey(date)) return 'Nieprawidłowa data terminu.';
+  if (time && Number.isNaN(toMinutes(time))) return 'Nieprawidłowa godzina terminu.';
+  return null;
+}
+
+/** Czy zadanie ma termin w przeszłości i wciąż nie jest ukończone? */
+export function isTaskOverdue(task, today = dateKey()) {
+  return !!(task && task.deadlineDate && !task.completed && task.deadlineDate < today);
+}
+
+/** Krótki, czytelny opis terminu zadania, np. "Dziś", "Jutro, 18:00", "12 października". */
+export function formatTaskDeadline(deadlineDate, deadlineTime) {
+  if (!deadlineDate) return '';
+  const today = dateKey();
+  let label;
+  if (deadlineDate === today) label = 'Dziś';
+  else if (deadlineDate === shiftDateKey(today, 1)) label = 'Jutro';
+  else if (deadlineDate === shiftDateKey(today, -1)) label = 'Wczoraj';
+  else label = formatDateShort(deadlineDate);
+  return deadlineTime ? `${label}, ${deadlineTime}` : label;
+}
+
+function sortDeadlineTasks(list) {
+  return list.sort((a, b) =>
+    (Number(!!a.completed) - Number(!!b.completed))
+    || String(a.deadlineTime || '99:99').localeCompare(String(b.deadlineTime || '99:99'))
+    || a.title.localeCompare(b.title, 'pl'));
+}
+
+/** Zadania (z jakiejkolwiek listy) z terminem przypadającym na dany dzień, posortowane do wyświetlenia. */
+export function tasksWithDeadlineOn(tasks, dateKeyValue) {
+  return sortDeadlineTasks(tasks.filter((t) => t.deadlineDate === dateKeyValue));
+}
+
+/** Mapa dzień → zadania z terminem tego dnia (dla widoku miesiąca – liczymy raz, nie per-dzień). */
+export function groupTasksByDeadline(tasks) {
+  const map = new Map();
+  for (const t of tasks) {
+    if (!t.deadlineDate) continue;
+    if (!map.has(t.deadlineDate)) map.set(t.deadlineDate, []);
+    map.get(t.deadlineDate).push(t);
+  }
+  for (const list of map.values()) sortDeadlineTasks(list);
+  return map;
 }
 
 // ------------------------------------------------- LISTY ZADAŃ I PODZADANIA --
@@ -410,6 +512,30 @@ export function listGroups(cards, path, now = Date.now()) {
     map.set(c[field], g);
   }
   return [...map.values()].sort((a, b) => a.name.localeCompare(b.name, 'pl', { numeric: true, sensitivity: 'base' }));
+}
+
+/**
+ * Spłaszczona lista WSZYSTKICH istniejących węzłów hierarchii fiszek (każdy przedmiot,
+ * każdy jego temat, każde jego zagadnienie – każdy raz), w porządku przedmiot → jego tematy
+ * → ich zagadnienia. Używana na pierwszym ekranie zakładki Fiszki do szybkiego wyboru,
+ * z czego się uczyć, bez klikania przez okruszki poziom po poziomie.
+ * `depth`: 0 = przedmiot, 1 = temat, 2 = zagadnienie.
+ */
+export function buildScopeOptions(cards) {
+  const options = [];
+  for (const s of listGroups(cards, { subject: null, topic: null, subtopic: null })) {
+    const subjectPath = { subject: s.name, topic: null, subtopic: null };
+    options.push({ path: subjectPath, label: s.name, depth: 0, total: s.total });
+    for (const t of listGroups(cards, subjectPath)) {
+      const topicPath = { subject: s.name, topic: t.name, subtopic: null };
+      options.push({ path: topicPath, label: t.name, depth: 1, total: t.total });
+      for (const st of listGroups(cards, topicPath)) {
+        const subtopicPath = { subject: s.name, topic: t.name, subtopic: st.name };
+        options.push({ path: subtopicPath, label: st.name, depth: 2, total: st.total });
+      }
+    }
+  }
+  return options;
 }
 
 /** Najgłębsza wspólna ścieżka zaimportowanych fiszek (żeby po imporcie od razu je pokazać). */

@@ -26,7 +26,7 @@ import * as L from './logic.js';
 window.__lifeosBooted = true; // informuje ekran startowy, że moduły się załadowały
 
 // ============================================================ 1. START I FIREBASE
-const APP_VERSION = '1.1.0';
+const APP_VERSION = '1.2.0';
 const HOUR_PX = 64; // wysokość jednej godziny na osi czasu (musi zgadzać się z .tl-body w index.html: 18 × 64 = 1152)
 
 // Wymagane są tylko te 4 pola. storageBucket i messagingSenderId mogą zostać z „WKLEJ_TUTAJ”, bo aplikacja z nich nie korzysta.
@@ -424,6 +424,8 @@ const PlannerView = {
       + (state.date !== today ? '<button type="button" class="btn btn-tonal" style="margin-top:.6rem" data-act="pl-today">Wróć do dziś</button>' : '');
     $('#pl-datebtn').textContent = state.date === today ? 'Dziś' : L.formatDateShort(state.date);
 
+    const deadlineTasks = L.tasksWithDeadlineOn(state.tasks, state.date);
+
     $('#pl-allday').innerHTML = allDay.map((ev) => {
       const color = L.safeColor(ev.colorCode);
       const span = ev.date === ev.endDate ? '' : L.formatDateRangeShort(ev.date, ev.endDate);
@@ -432,7 +434,15 @@ const PlannerView = {
         style="border-left-color:${color};background-color:${color}22" aria-label="Całodniowe: ${esc(ev.title)}${span ? `, ${esc(span)}` : ''}${descLabel}">
         <span class="allday-title">${esc(ev.title)}</span>${span ? `<span class="allday-range">${esc(span)}</span>` : ''}
         ${ev.description ? `<span class="allday-range line-clamp-2">${esc(ev.description)}</span>` : ''}</button>`;
+    }).join('') + deadlineTasks.map((t) => {
+      const pr = L.PRIORITIES.includes(t.priority) ? t.priority : 'medium';
+      const label = L.formatTaskDeadline(t.deadlineDate, t.deadlineTime);
+      return `<button type="button" class="allday-chip allday-chip-task pr-${pr}${t.completed ? ' done' : ''}" data-act="ta-goto" data-id="${esc(t.id)}"
+        aria-label="Termin zadania: ${esc(t.title)}, ${esc(label)}${t.completed ? ', ukończone' : ''}">
+        ${icon(t.completed ? 'check-circle-2' : 'circle')}
+        <span class="allday-title">${esc(t.title)}</span><span class="allday-range">${esc(label)}</span></button>`;
     }).join('');
+    if (deadlineTasks.length) refreshIcons();
 
     const blocks = L.layoutEvents(timed).map((ev) => {
       const color = L.safeColor(ev.colorCode);
@@ -461,21 +471,30 @@ const PlannerView = {
     const weeks = L.monthGrid(state.month);
     const head = L.WEEKDAY_LABELS_PL.map((w) => `<div class="mg-head">${esc(w)}</div>`).join('');
     const MAX_SHOWN = 3;
+    const deadlineMap = L.groupTasksByDeadline(state.tasks);
     const body = weeks.map((week) => week.map((cell) => {
       const dayEvents = state.monthEvents.filter((ev) => L.eventTouchesDay(ev, cell.key))
         .sort((a, b) => (Number(!!b.allDay) - Number(!!a.allDay)) || (a.startTime || '').localeCompare(b.startTime || '') || a.title.localeCompare(b.title, 'pl'));
-      const shown = dayEvents.slice(0, MAX_SHOWN);
-      const chips = shown.map((ev) => {
+      const dayTasks = deadlineMap.get(cell.key) || [];
+      const shownEvents = dayEvents.slice(0, MAX_SHOWN);
+      const shownTasks = dayTasks.slice(0, Math.max(0, MAX_SHOWN - shownEvents.length));
+      const chips = shownEvents.map((ev) => {
         const color = L.safeColor(ev.colorCode);
         return `<span class="mg-chip" style="background-color:${color}26;border-left-color:${color}">${esc(ev.title)}</span>`;
+      }).join('') + shownTasks.map((t) => {
+        const pr = L.PRIORITIES.includes(t.priority) ? t.priority : 'medium';
+        return `<span class="mg-chip mg-chip-task pr-${pr}${t.completed ? ' done' : ''}">${esc(t.title)}</span>`;
       }).join('');
-      const restCount = dayEvents.length - shown.length;
+      const totalCount = dayEvents.length + dayTasks.length;
+      const restCount = totalCount - shownEvents.length - shownTasks.length;
       const more = restCount > 0 ? `<span class="mg-more">+${restCount} więcej</span>` : '';
-      const label = `${L.formatDateLong(cell.key)}${dayEvents.length ? `, ${L.plural(dayEvents.length, WORDS.event)}: ${dayEvents.map((e) => e.title).join(', ')}` : ''}`;
+      const label = `${L.formatDateLong(cell.key)}`
+        + (dayEvents.length ? `, ${L.plural(dayEvents.length, WORDS.event)}: ${dayEvents.map((e) => e.title).join(', ')}` : '')
+        + (dayTasks.length ? `, terminy zadań: ${dayTasks.map((t) => t.title).join(', ')}` : '');
       return `<button type="button" class="mg-day${cell.inMonth ? '' : ' mg-out'}${cell.key === today ? ' mg-today' : ''}${cell.key === state.date ? ' mg-selected' : ''}"
         data-act="pl-goto-day" data-key="${cell.key}" aria-label="${esc(label)}">
         <span class="mg-num">${cell.day}</span>
-        ${dayEvents.length ? `<span class="mg-events">${chips}${more}</span>` : ''}</button>`;
+        ${totalCount ? `<span class="mg-events">${chips}${more}</span>` : ''}</button>`;
     }).join('')).join('');
     $('#pl-monthview').innerHTML = `<div class="mg-head-row">${head}</div><div class="mg-grid">${body}</div>`;
   },
@@ -685,8 +704,56 @@ async function deleteTaskList(id) {
   });
 }
 
+/** Skok z „terminu zadania” w Planerze do tego zadania w Zadaniach: przełącza listę i podświetla wiersz. */
+function gotoTaskFromDeadline(id) {
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t) return;
+  setCurrentList(t.listId || null);
+  TasksView.scrollToId = id;
+  location.hash = '#/zadania';
+}
+
+/** Edycja istniejącego zadania/podzadania: nazwa, priorytet (tylko zadania główne) i termin. */
+function openTaskSheet(id) {
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t) return;
+  const isSub = !!t.parentId;
+  const prioField = isSub ? '' : `<fieldset class="seg-field"><legend class="label">Priorytet</legend>
+      <div class="seg">${L.PRIORITIES.map((p) => `<label class="seg-opt"><input type="radio" name="priority" value="${p}" class="sr-only" ${t.priority === p ? 'checked' : ''}><span>${L.PRIORITY_LABEL[p]}</span></label>`).join('')}</div></fieldset>`;
+  openSheet({
+    title: isSub ? 'Edytuj podzadanie' : 'Edytuj zadanie',
+    body: `<form data-form="task-edit" data-id="${esc(id)}" style="display:flex;flex-direction:column;gap:.9rem" novalidate>
+      <div><label class="label" for="te-title">Nazwa</label>
+        <input id="te-title" name="title" class="field" maxlength="200" value="${esc(t.title)}" autofocus autocomplete="off"></div>
+      ${prioField}
+      <div style="display:grid;grid-template-columns:1fr 1fr;gap:.75rem">
+        <div><label class="label" for="te-date">Termin (opcjonalnie)</label><input id="te-date" name="deadlineDate" type="date" class="field" value="${esc(t.deadlineDate || '')}"></div>
+        <div><label class="label" for="te-time">Godzina</label><input id="te-time" name="deadlineTime" type="time" class="field" value="${esc(t.deadlineTime || '')}"></div>
+      </div>
+      <p class="form-hint">Godzina ma sens tylko razem z datą. Wyczyść pole daty, żeby usunąć termin.</p>
+      <p class="form-error hide" role="alert"></p>
+      <div style="display:flex;gap:.5rem">
+        <button type="button" class="btn btn-lg btn-danger" data-act="ta-del" data-id="${esc(id)}" aria-label="Usuń ${isSub ? 'podzadanie' : 'zadanie'}: ${esc(t.title)}">${icon('trash-2')}</button>
+        <button type="submit" class="btn btn-lg btn-primary" style="flex:1">Zapisz zmiany</button>
+      </div></form>`,
+  });
+}
+
+/** Mały arkusz z rzadziej używanymi akcjami na zadaniu: przesuwanie w górę/dół, dodanie podzadania. */
+function openTaskRowMenu(id, { up = false, down = false, addsub = false } = {}) {
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t) return;
+  const rowBtn = (act, ic, label) => `<button type="button" class="btn btn-plain" style="width:100%;justify-content:flex-start;gap:.6rem;min-height:52px" data-act="${act}" data-id="${esc(id)}">${icon(ic)} ${label}</button>`;
+  const rows = [
+    up ? rowBtn('ta-move-up', 'arrow-up', 'Przesuń wyżej') : '',
+    down ? rowBtn('ta-move-down', 'arrow-down', 'Przesuń niżej') : '',
+    addsub ? rowBtn('ta-subtask-add', 'corner-down-right', 'Dodaj podzadanie') : '',
+  ].filter(Boolean).join('');
+  openSheet({ title: t.title, body: `<div style="display:flex;flex-direction:column;gap:.35rem">${rows}</div>` });
+}
+
 const TasksView = {
-  mounted: false, prio: 'medium', focusId: null, addingSubtaskFor: null, focusSubtaskInput: false,
+  mounted: false, prio: 'medium', focusId: null, scrollToId: null, addingSubtaskFor: null, focusSubtaskInput: false,
 
   mount() {
     $('#view').innerHTML = `<div class="page">
@@ -715,17 +782,23 @@ const TasksView = {
   },
   cycleNew() { this.prio = L.nextPriority(this.prio); this.renderPrio(); },
 
-  row(t, { sub = false } = {}) {
+  row(t, { sub = false, canUp = false, canDown = false, canAddSub = false } = {}) {
     const done = !!t.completed;
     const prioBtn = sub ? '' : `<button type="button" class="chip-btn" data-act="ta-prio" data-id="${esc(t.id)}" aria-label="Priorytet: ${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}. Zmień. Zadanie: ${esc(t.title)}">
         <span class="chip chip-${L.PRIORITIES.includes(t.priority) ? t.priority : 'medium'}">${L.PRIORITY_LABEL[t.priority] || L.PRIORITY_LABEL.medium}</span></button>`;
-    const subtaskBtn = sub ? '' : `<button type="button" class="icon-btn" data-act="ta-subtask-add" data-id="${esc(t.id)}" aria-label="Dodaj podzadanie do: ${esc(t.title)}">${icon('corner-down-right')}</button>`;
+    const showMenu = canUp || canDown || canAddSub;
+    const menuBtn = showMenu ? `<button type="button" class="icon-btn" data-act="ta-row-menu" data-id="${esc(t.id)}"
+        data-up="${canUp ? '1' : '0'}" data-down="${canDown ? '1' : '0'}" data-addsub="${canAddSub ? '1' : '0'}"
+        aria-label="Więcej opcji: ${esc(t.title)}">${icon('more-vertical')}</button>` : '';
+    const overdue = L.isTaskOverdue(t);
+    const deadline = t.deadlineDate ? `<span class="task-deadline${overdue ? ' overdue' : ''}">${icon(overdue ? 'alarm-clock' : 'calendar', 'ic')}${esc(L.formatTaskDeadline(t.deadlineDate, t.deadlineTime))}</span>` : '';
     return `<li class="card${sub ? ' task-sub' : ''}" data-task="${esc(t.id)}" style="display:flex;align-items:center;gap:.25rem;padding:.25rem .25rem .25rem .35rem">
       <label class="check-wrap"><input type="checkbox" class="check-in sr-only" data-id="${esc(t.id)}" ${done ? 'checked' : ''} aria-label="${done ? 'Ukończone' : 'Do zrobienia'}: ${esc(t.title)}">
         <span class="check-box">${icon('check')}</span></label>
-      <p class="${done ? 'task-done' : ''}" style="flex:1;min-width:0;overflow-wrap:anywhere;padding:.4rem 0">${esc(t.title)}</p>
-      ${prioBtn}${subtaskBtn}
-      <button type="button" class="icon-btn danger" data-act="ta-del" data-id="${esc(t.id)}" aria-label="Usuń zadanie: ${esc(t.title)}">${icon('trash-2')}</button></li>`;
+      <button type="button" class="task-title-btn" data-act="ta-edit" data-id="${esc(t.id)}" aria-label="Edytuj ${sub ? 'podzadanie' : 'zadanie'}: ${esc(t.title)}">
+        <span class="${done ? 'task-done' : ''}" style="overflow-wrap:anywhere">${esc(t.title)}</span>${deadline}</button>
+      ${prioBtn}${menuBtn}
+      <button type="button" class="icon-btn danger" data-act="ta-del" data-id="${esc(t.id)}" aria-label="Usuń ${sub ? 'podzadanie' : 'zadanie'}: ${esc(t.title)}">${icon('trash-2')}</button></li>`;
   },
 
   subtaskForm(parentId) {
@@ -738,9 +811,20 @@ const TasksView = {
       </form></li>`;
   },
 
-  rowWithChildren(t) {
-    let html = this.row(t);
-    for (const sub of t.subtasks) html += this.row(sub, { sub: true });
+  /** `topIdx`/`topTotal`: pozycja TEGO zadania wśród otwartych zadań głównych (do strzałek góra/dół). */
+  rowWithChildren(t, { topIdx = -1, topTotal = 0 } = {}) {
+    const canUp = !t.completed && topIdx > 0;
+    const canDown = !t.completed && topIdx !== -1 && topIdx < topTotal - 1;
+    let html = this.row(t, { canUp, canDown, canAddSub: true });
+    const openSubs = t.subtasks.filter((s) => !s.completed);
+    for (const sub of t.subtasks) {
+      const subIdx = openSubs.findIndex((s) => s.id === sub.id);
+      html += this.row(sub, {
+        sub: true,
+        canUp: !sub.completed && subIdx > 0,
+        canDown: !sub.completed && subIdx !== -1 && subIdx < openSubs.length - 1,
+      });
+    }
     if (this.addingSubtaskFor === t.id) html += this.subtaskForm(t.id);
     return html;
   },
@@ -766,7 +850,7 @@ const TasksView = {
     if (!listTasks.length) {
       html = '<div class="card" style="padding:1.5rem;margin-top:1.25rem"><p style="font-weight:600">Brak zadań</p><p class="text-muted" style="margin-top:.25rem">Wpisz pierwsze zadanie w polu na dole ekranu.</p></div>';
     } else {
-      if (open.length) html += `<h2 class="section-title">Do zrobienia</h2><ul class="space-y-2" role="list">${open.map((t) => this.rowWithChildren(t)).join('')}</ul>`;
+      if (open.length) html += `<h2 class="section-title">Do zrobienia</h2><ul class="space-y-2" role="list">${open.map((t, i) => this.rowWithChildren(t, { topIdx: i, topTotal: open.length })).join('')}</ul>`;
       else html += '<div class="card" style="padding:1.25rem;margin-top:1.25rem"><p style="font-weight:600">Wszystko zrobione</p></div>';
       if (done.length) {
         html += `<div style="display:flex;align-items:center;justify-content:space-between;gap:.5rem"><h2 class="section-title">Ukończone (${done.length})</h2>`
@@ -781,6 +865,15 @@ const TasksView = {
       if (cb) cb.focus();
       this.focusId = null;
     }
+    if (this.scrollToId) {
+      const row = $(`[data-task="${CSS.escape(this.scrollToId)}"]`);
+      if (row) {
+        row.scrollIntoView({ block: 'center' });
+        row.classList.add('task-flash');
+        setTimeout(() => row.classList.remove('task-flash'), 1500);
+      }
+      this.scrollToId = null;
+    }
     if (this.focusSubtaskInput) {
       const inp = $('#ta-sub-input');
       if (inp) inp.focus();
@@ -792,6 +885,18 @@ const TasksView = {
   cyclePriority(id) {
     const t = state.tasks.find((x) => x.id === id);
     if (t) updateDoc(docRef('tasks', id), { priority: L.nextPriority(t.priority) }).catch(dbError);
+  },
+  /** Przesuwa zadanie o jedno miejsce w górę (-1) albo w dół (+1) wśród otwartego rodzeństwa. */
+  move(id, direction) {
+    const t = state.tasks.find((x) => x.id === id);
+    if (!t) return;
+    const openSiblings = state.tasks.filter((x) => !x.completed
+      && (x.listId || null) === (t.listId || null) && (x.parentId || null) === (t.parentId || null));
+    const plan = L.planMoveTask(openSiblings, id, direction);
+    if (!plan) return;
+    const batch = writeBatch(db);
+    plan.forEach((p) => batch.update(docRef('tasks', p.id), { order: p.order }));
+    batch.commit().catch(dbError);
   },
   /** Usuwa zadanie. Jeśli ma podzadania, kasuje je razem (jeden „Cofnij” przywraca wszystko naraz). */
   remove(id) {
@@ -826,8 +931,46 @@ const TasksView = {
 const cardsHash = (p) => `#/fiszki${[p.subject, p.topic, p.subtopic].filter((v) => v != null).map((v) => `/${encodeURIComponent(v)}`).join('')}`;
 const pathName = (p) => [p.subject, p.topic, p.subtopic].filter((v) => v != null).join(' › ');
 
+/** -1 = „Wszystkie fiszki”, inaczej indeks do L.buildScopeOptions(state.cards). */
+function scopeIndexToPath(idx) {
+  if (!Number.isFinite(idx) || idx === -1) return { subject: null, topic: null, subtopic: null };
+  const opt = L.buildScopeOptions(state.cards)[idx];
+  return opt ? opt.path : { subject: null, topic: null, subtopic: null };
+}
+
+/** <option>/<optgroup> dla wyboru zakresu nauki na pierwszym ekranie Fiszek. */
+function buildScopeSelectHtml(opts, idx, allCount) {
+  let html = `<option value="-1" ${idx === -1 ? 'selected' : ''}>Wszystkie fiszki (${allCount})</option>`;
+  let openGroup = false;
+  opts.forEach((o, i) => {
+    if (o.depth === 0) {
+      if (openGroup) html += '</optgroup>';
+      html += `<optgroup label="${esc(o.label)}">`;
+      openGroup = true;
+      html += `<option value="${i}" ${i === idx ? 'selected' : ''}>${esc(o.label)} — cały przedmiot (${o.total})</option>`;
+    } else {
+      const prefix = o.depth === 2 ? '—— ' : '— ';
+      html += `<option value="${i}" ${i === idx ? 'selected' : ''}>${prefix}${esc(o.label)} (${o.total})</option>`;
+    }
+  });
+  if (openGroup) html += '</optgroup>';
+  return html;
+}
+
+/** Lista fiszek do przeglądania (przód/tył, edycja, usuwanie) – ten sam znacznik na liście
+ * leafa (poziom 3) i na pierwszym ekranie pod wyborem zakresu. */
+function cardListHtml(items) {
+  const list = [...items].sort((a, b) => (a.createdAtMs - b.createdAtMs) || a.front.localeCompare(b.front, 'pl'));
+  return `<ul class="space-y-2" role="list">${list.map((c) => `<li class="card" style="display:flex;gap:.25rem;align-items:flex-start;padding:.75rem .5rem .75rem 1rem">
+      <div style="flex:1;min-width:0"><p class="line-clamp-3" style="font-weight:600;overflow-wrap:anywhere">${esc(c.front)}</p>
+        <p class="line-clamp-2 text-muted" style="font-size:.9rem;margin-top:.15rem;overflow-wrap:anywhere">${esc(c.back)}</p>
+        <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.5rem"><span class="chip chip-${c.status in L.STATUS_LABEL ? c.status : 'new'}">${L.STATUS_LABEL[c.status] || L.STATUS_LABEL.new}</span>${c.type === 'language' ? '<span class="chip chip-lang chip-none">Językowa</span>' : ''}</div></div>
+      <button type="button" class="icon-btn" data-act="fc-edit" data-id="${esc(c.id)}" aria-label="Edytuj fiszkę: ${esc(c.front)}">${icon('pencil')}</button>
+      <button type="button" class="icon-btn danger" data-act="fc-del" data-id="${esc(c.id)}" aria-label="Usuń fiszkę: ${esc(c.front)}">${icon('trash-2')}</button></li>`).join('')}</ul>`;
+}
+
 const CardsView = {
-  mounted: false,
+  mounted: false, browseIdx: -1,
 
   mount() {
     $('#view').innerHTML = '<div class="page" id="fc-page"></div>';
@@ -837,9 +980,34 @@ const CardsView = {
       </div>`;
     $('#main').scrollTop = 0;
     this.mounted = true;
+    this.browseIdx = -1;
     refreshIcons();
   },
   unmount() { this.mounted = false; },
+
+  /** Widget pierwszego ekranu: wybór zakresu nauki + akcje + lista fiszek do przeglądania. */
+  renderBrowsePicker() {
+    const opts = L.buildScopeOptions(state.cards);
+    const path = scopeIndexToPath(this.browseIdx);
+    const items = L.filterByPath(state.cards, path);
+    const due = items.filter((c) => L.isDue(c)).length;
+    const hard = items.filter((c) => c.status === 'hard').length;
+    const shown = items.slice(0, L.MAX_BROWSE_SHOWN);
+    const overflow = items.length > shown.length
+      ? `<p class="text-muted" style="margin-top:.5rem;font-size:.85rem">Pokazano ${shown.length} z ${items.length}. Zwęż wybór powyżej, żeby zobaczyć resztę.</p>` : '';
+    return `<div class="card" style="padding:1rem;margin-top:1.25rem">
+        <label class="label" for="fc-scope">Z czego się uczyć</label>
+        <select id="fc-scope" class="field">${buildScopeSelectHtml(opts, this.browseIdx, state.cards.length)}</select>
+        <button type="button" class="btn btn-primary btn-lg" style="width:100%;margin-top:.75rem" data-act="fc-study" data-mode="due" data-scope-idx="${this.browseIdx}" ${due ? '' : 'disabled'}>${icon('play')} ${due ? `Ucz się: ${due} do powtórki` : 'Wszystko powtórzone'}</button>
+        <div style="display:flex;gap:.5rem;margin-top:.6rem">
+          <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="all" data-scope-idx="${this.browseIdx}" ${items.length ? '' : 'disabled'}>Wszystkie (${items.length})</button>
+          <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="hard" data-scope-idx="${this.browseIdx}" ${hard ? '' : 'disabled'}>Trudne (${hard})</button>
+        </div>
+        <button type="button" class="btn btn-tonal" style="width:100%;margin-top:.6rem" data-act="fc-share" data-scope-idx="${this.browseIdx}" ${items.length ? '' : 'disabled'}>${icon('share-2')} Udostępnij (${items.length})</button>
+      </div>
+      <h2 class="section-title">Fiszki do przeglądania</h2>
+      ${items.length ? cardListHtml(shown) + overflow : '<p class="text-muted">Ten zakres jest pusty.</p>'}`;
+  },
 
   update() {
     const path = state.path;
@@ -866,6 +1034,17 @@ const CardsView = {
         <p class="text-muted" style="margin-top:.35rem;line-height:1.5">Dotknij „Importuj z AI” na dole, skopiuj gotowy prompt, wklej go do Claude i wklej z powrotem odpowiedź. Możesz też dodać pojedynczą fiszkę przyciskiem plus.</p></div>`;
     } else if (!inPath.length) {
       html += '<div class="card" style="padding:1.5rem;margin-top:1.25rem"><p class="text-muted">W tym miejscu nie ma już fiszek. Wróć wyżej przez ścieżkę na górze.</p></div>';
+    } else if (level === 0) {
+      html += this.renderBrowsePicker();
+      html += `<h2 class="section-title">Przedmioty</h2><ul class="space-y-2" role="list">`;
+      html += L.listGroups(state.cards, path).map((g) => {
+        const next = { ...path, [L.CARD_FIELDS[level]]: g.name };
+        return `<li><a class="card card-link" href="${cardsHash(next)}"><span style="flex:1;min-width:0"><span style="display:block;font-weight:600;overflow-wrap:anywhere">${esc(g.name)}</span>
+          <span class="text-muted" style="font-size:.9rem">${L.plural(g.total, WORDS.card)}</span></span>
+          ${g.due ? `<span class="chip chip-good chip-none">${g.due} do powtórki</span>` : ''}${g.hard ? `<span class="chip chip-hard chip-none">${g.hard} trudnych</span>` : ''}
+          ${icon('chevron-right', 'ic text-muted')}</a></li>`;
+      }).join('');
+      html += '</ul>';
     } else {
       const due = inPath.filter((c) => L.isDue(c)).length;
       const hard = inPath.filter((c) => c.status === 'hard').length;
@@ -875,7 +1054,7 @@ const CardsView = {
           <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="all">Wszystkie (${inPath.length})</button>
           <button type="button" class="btn btn-plain" style="flex:1" data-act="fc-study" data-mode="hard" ${hard ? '' : 'disabled'}>Trudne (${hard})</button>
         </div>
-        <button type="button" class="btn btn-tonal" style="width:100%;margin-top:.6rem" data-act="fc-share">${icon('share-2')} Udostępnij ${level ? `ten dział (${inPath.length})` : `wszystkie (${inPath.length})`}</button></div>`;
+        <button type="button" class="btn btn-tonal" style="width:100%;margin-top:.6rem" data-act="fc-share">${icon('share-2')} Udostępnij ten dział (${inPath.length})</button></div>`;
 
       if (level < 3) {
         html += `<h2 class="section-title">${['Przedmioty', 'Tematy', 'Zagadnienia'][level]}</h2><ul class="space-y-2" role="list">`;
@@ -888,17 +1067,9 @@ const CardsView = {
         }).join('');
         html += '</ul>';
       } else {
-        const list = [...inPath].sort((a, b) => (a.createdAtMs - b.createdAtMs) || a.front.localeCompare(b.front, 'pl'));
-        html += `<h2 class="section-title">Fiszki</h2><ul class="space-y-2" role="list">${list.map((c) => `<li class="card" style="display:flex;gap:.25rem;align-items:flex-start;padding:.75rem .5rem .75rem 1rem">
-          <div style="flex:1;min-width:0"><p class="line-clamp-3" style="font-weight:600;overflow-wrap:anywhere">${esc(c.front)}</p>
-            <p class="line-clamp-2 text-muted" style="font-size:.9rem;margin-top:.15rem;overflow-wrap:anywhere">${esc(c.back)}</p>
-            <div style="display:flex;gap:.4rem;flex-wrap:wrap;margin-top:.5rem"><span class="chip chip-${c.status in L.STATUS_LABEL ? c.status : 'new'}">${L.STATUS_LABEL[c.status] || L.STATUS_LABEL.new}</span>${c.type === 'language' ? '<span class="chip chip-lang chip-none">Językowa</span>' : ''}</div></div>
-          <button type="button" class="icon-btn" data-act="fc-edit" data-id="${esc(c.id)}" aria-label="Edytuj fiszkę: ${esc(c.front)}">${icon('pencil')}</button>
-          <button type="button" class="icon-btn danger" data-act="fc-del" data-id="${esc(c.id)}" aria-label="Usuń fiszkę: ${esc(c.front)}">${icon('trash-2')}</button></li>`).join('')}</ul>`;
+        html += `<h2 class="section-title">Fiszki</h2>${cardListHtml(inPath)}`;
       }
-      if (level > 0) {
-        html += `<div style="margin-top:2rem"><button type="button" class="btn btn-danger" data-act="fc-del-group">${icon('trash-2')} Usuń ten dział (${inPath.length})</button></div>`;
-      }
+      html += `<div style="margin-top:2rem"><button type="button" class="btn btn-danger" data-act="fc-del-group">${icon('trash-2')} Usuń ten dział (${inPath.length})</button></div>`;
     }
     $('#fc-page').innerHTML = html;
     refreshIcons();
@@ -1018,15 +1189,15 @@ function previewImport() {
  * Zapis idzie w JEDNYM batchu: sama paczka (`shares/{id}`, do pobrania przez link)
  * + wskaźnik właściciela (`users/{uid}/shares_sent/{id}`, żeby dało się ją potem cofnąć).
  */
-async function shareCurrentPath() {
-  const items = L.filterByPath(state.cards, state.path);
+async function shareCurrentPath(path = state.path) {
+  const items = L.filterByPath(state.cards, path);
   const sizeError = L.validateShareSize(items.length);
   if (sizeError) { toast(sizeError, { ms: 8000 }); return; }
   openSheet({ title: 'Udostępnianie…', body: '<p class="text-muted" style="padding:1rem 0">Tworzę link…</p>' });
   try {
     const shareRef = doc(collection(db, 'shares'));
     const pointerRef = docRef('shares_sent', shareRef.id);
-    const label = pathName(state.path) || 'Wszystkie fiszki';
+    const label = pathName(path) || 'Wszystkie fiszki';
     const batch = writeBatch(db);
     batch.set(shareRef, { ownerUid: state.user.uid, createdAt: serverTimestamp(), cards: L.buildShareSnapshot(items) });
     batch.set(pointerRef, { createdAt: serverTimestamp(), cardCount: items.length, label });
@@ -1147,8 +1318,8 @@ let study = null;
 const findCard = (id) => state.cards.find((c) => c.id === id);
 const sizeClass = (t) => (t.length <= 40 ? 't-3' : t.length <= 120 ? 't-2' : t.length <= 300 ? 't-1' : 't-0');
 
-function startStudy(mode) {
-  const queue = L.buildStudyQueue(L.filterByPath(state.cards, state.path), mode);
+function startStudy(mode, path = state.path) {
+  const queue = L.buildStudyQueue(L.filterByPath(state.cards, path), mode);
   if (!queue.length) { toast('Brak fiszek w tym trybie.'); return; }
   study = { queue: queue.map((c) => c.id), index: 0, flipped: false, reversed: false, tally: { hard: 0, good: 0, easy: 0 }, seen: 0 };
   const dlg = $('#study');
@@ -1395,14 +1566,19 @@ const actions = {
   },
   'ta-newprio': () => TasksView.cycleNew(),
   'ta-prio': (el) => TasksView.cyclePriority(el.dataset.id),
-  'ta-del': (el) => TasksView.remove(el.dataset.id),
+  'ta-del': (el) => { closeSheet(); TasksView.remove(el.dataset.id); },
   'ta-clear-done': () => TasksView.clearDone(),
   'ta-switch-list': () => openListSwitcher(),
   'ta-list-pick': (el) => { setCurrentList(el.dataset.id || null); closeSheet(); },
   'ta-list-rename': (el) => openListRename(el.dataset.id),
   'ta-list-del': (el) => deleteTaskList(el.dataset.id),
-  'ta-subtask-add': (el) => TasksView.startAddSubtask(el.dataset.id),
+  'ta-subtask-add': (el) => { closeSheet(); TasksView.startAddSubtask(el.dataset.id); },
   'ta-subtask-cancel': () => TasksView.cancelAddSubtask(),
+  'ta-edit': (el) => openTaskSheet(el.dataset.id),
+  'ta-row-menu': (el) => openTaskRowMenu(el.dataset.id, { up: el.dataset.up === '1', down: el.dataset.down === '1', addsub: el.dataset.addsub === '1' }),
+  'ta-move-up': (el) => { closeSheet(); TasksView.move(el.dataset.id, -1); },
+  'ta-move-down': (el) => { closeSheet(); TasksView.move(el.dataset.id, 1); },
+  'ta-goto': (el) => gotoTaskFromDeadline(el.dataset.id),
   'fc-import': () => openImport(),
   'fc-new': () => openCardSheet(),
   'fc-edit': (el) => openCardSheet(el.dataset.id),
@@ -1418,8 +1594,8 @@ const actions = {
     location.hash = cardsHash(up);
     deleteManyWithUndo('flashcards', items, `Usunięto ${L.plural(items.length, WORDS.card)}`);
   },
-  'fc-study': (el) => startStudy(el.dataset.mode),
-  'fc-share': () => shareCurrentPath(),
+  'fc-study': (el) => startStudy(el.dataset.mode, el.dataset.scopeIdx != null ? scopeIndexToPath(Number(el.dataset.scopeIdx)) : state.path),
+  'fc-share': (el) => shareCurrentPath(el && el.dataset.scopeIdx != null ? scopeIndexToPath(Number(el.dataset.scopeIdx)) : state.path),
   'fc-my-shares': () => { closeSheet(); openMyShares(); },
   'fc-share-revoke': (el) => revokeShare(el.dataset.id),
   'st-flip': () => flipCard(),
@@ -1457,9 +1633,12 @@ const forms = {
     const input = f.title;
     const title = input.value.trim();
     if (!title) { input.focus(); return; }
+    const siblings = state.tasks.filter((x) => !x.completed && !x.parentId && (x.listId || null) === (state.currentListId || null));
+    const order = L.nextOrderValue(siblings);
     addDoc(colRef('tasks'), {
       title, completed: false, priority: TasksView.prio, createdAt: serverTimestamp(),
       ...(state.currentListId ? { listId: state.currentListId } : {}),
+      ...(order != null ? { order } : {}),
     }).catch(dbError);
     input.value = '';
     input.focus();
@@ -1468,12 +1647,47 @@ const forms = {
   subtask: (f) => {
     const title = String(new FormData(f).get('title') || '').trim();
     if (!title) return;
+    const parentId = f.dataset.parent;
+    const siblings = state.tasks.filter((x) => !x.completed && x.parentId === parentId);
+    const order = L.nextOrderValue(siblings);
     addDoc(colRef('tasks'), {
-      title, completed: false, priority: 'medium', createdAt: serverTimestamp(), parentId: f.dataset.parent,
+      title, completed: false, priority: 'medium', createdAt: serverTimestamp(), parentId,
       ...(state.currentListId ? { listId: state.currentListId } : {}),
+      ...(order != null ? { order } : {}),
     }).catch(dbError);
     TasksView.addingSubtaskFor = null;
     scheduleRender();
+  },
+
+  /** Edycja zadania: setDoc (pełne nadpisanie z zachowaniem pól, których formularz nie dotyka),
+   * nie updateDoc – dzięki temu wyczyszczenie pola terminu w formularzu rzeczywiście USUWA je
+   * z bazy, a nie tylko pomija (merge w updateDoc zostawiłby starą wartość). */
+  'task-edit': (f) => {
+    const id = f.dataset.id;
+    const t = state.tasks.find((x) => x.id === id);
+    if (!t) { closeSheet(); return; }
+    const fd = new FormData(f);
+    const title = String(fd.get('title') || '').trim();
+    if (!title) { showFormError(f, 'Wpisz nazwę zadania.'); return; }
+    const deadlineDate = String(fd.get('deadlineDate') || '').trim();
+    const deadlineTime = String(fd.get('deadlineTime') || '').trim();
+    const error = L.validateDeadline({ deadlineDate, deadlineTime });
+    if (error) { showFormError(f, error); return; }
+    const data = toRaw(t);
+    delete data.deadlineDate;
+    delete data.deadlineTime;
+    data.title = title;
+    if (!t.parentId) {
+      const priority = fd.get('priority');
+      if (L.PRIORITIES.includes(priority)) data.priority = priority;
+    }
+    if (deadlineDate) {
+      data.deadlineDate = deadlineDate;
+      if (deadlineTime) data.deadlineTime = deadlineTime;
+    }
+    setDoc(docRef('tasks', id), data).catch(dbError);
+    closeSheet();
+    toast('Zapisano zmiany');
   },
 
   tasklist: (f) => {
@@ -1592,6 +1806,7 @@ function wireGlobalEvents() {
     const cb = e.target.closest('input.check-in');
     if (cb) TasksView.toggle(cb.dataset.id, cb.checked);
     if (e.target.id === 'pl-date' && e.target.value) setDate(e.target.value);
+    if (e.target.id === 'fc-scope') { CardsView.browseIdx = Number(e.target.value); scheduleRender(); }
     if (e.target.name === 'allDay') {
       const form = e.target.closest('form[data-form="event"]');
       if (form) toggleEventAllDayFields(form);

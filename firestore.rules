@@ -25,18 +25,35 @@ service cloud.firestore {
     function effectiveListId(d) {
       return d.get('listId', null);
     }
+    // Pole opcjonalne, ale JEŚLI występuje, musi być liczbą całkowitą (ręczna kolejność na liście).
+    function optionalInt(d, k) {
+      return !(k in d) || d[k] is int;
+    }
+    // Pole opcjonalne, ale JEŚLI występuje, musi być datą "RRRR-MM-DD" (termin zadania).
+    function optionalDateField(d, k) {
+      return !(k in d) || (d[k] is string && d[k].matches('^[0-9]{4}-[0-9]{2}-[0-9]{2}$'));
+    }
+    // Pole opcjonalne, ale JEŚLI występuje, musi być godziną "GG:MM" (godzina terminu zadania).
+    function optionalTimeField(d, k) {
+      return !(k in d) || (d[k] is string && d[k].matches('^([01][0-9]|2[0-3]):[0-5][0-9]$'));
+    }
 
     function validTask(d) {
       return d.keys().hasAll(['title', 'completed', 'priority'])
         // hasOnly (nie tylko limit liczby pól!) - żadne inne pole nie może się
         // "podszyć" pod dozwolone, zajmując miejsce np. createdAt.
-        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt', 'listId', 'parentId'])
+        && d.keys().hasOnly(['title', 'completed', 'priority', 'createdAt', 'listId', 'parentId', 'order', 'deadlineDate', 'deadlineTime'])
         && text(d.title, 300)
         && d.completed is bool
         && d.priority in ['low', 'medium', 'high']
         && optionalTimestamp(d, 'createdAt')
         && optionalRef(d, 'listId')
-        && optionalRef(d, 'parentId');
+        && optionalRef(d, 'parentId')
+        && optionalInt(d, 'order')
+        && optionalDateField(d, 'deadlineDate')
+        && optionalTimeField(d, 'deadlineTime')
+        // Godzina terminu ma sens tylko razem z datą terminu.
+        && (!('deadlineTime' in d) || ('deadlineDate' in d));
     }
 
     // Zadanie z parentId musi realnie wskazywać na INNE, ISTNIEJĄCE zadanie z TEJ SAMEJ
